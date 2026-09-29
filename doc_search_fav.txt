@@ -1,0 +1,3 @@
+main/work=C:\work
+main/Downloads=C:\Users\001533-inomata\Downloads
+main/Desktop=C:\Users\001533-inomata\Desktop

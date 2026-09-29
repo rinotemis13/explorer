@@ -1,0 +1,8 @@
+theme=ダーク（シンプル）
+font=Yu Gothic UI
+size=9
+panes=2
+editor=
+dpath=0
+zoomed=0
+geom=1180x680+54+33
