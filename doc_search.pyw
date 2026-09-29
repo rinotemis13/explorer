@@ -26,24 +26,31 @@
 #   F2:文書内検索フォルダ欄  F4:除外欄  F5:検索実行  F7:お気に入り
 #   F8:選択項目をお気に入り追加  F9:CSV出力  Ctrl+D:参照  F1:一覧
 #   Ctrl+Shift+K/O/I/P: 拡張子保存/お気に入り保存/インデックス作成/スキャン停止
-#   Alt+1/2/3: 文書内検索/エクスプローラ/設定タブへ  Ctrl+G: この場所で文書内検索
+#   Alt+1/2/3/4: 文書内検索/エクスプローラ/フォルダ検索/設定タブへ
+#   Ctrl+G: この場所で文書内検索
 #   Ctrl+Shift+E: サクラエディタで開く  Ctrl+Shift+C / S: ここでcmd / PowerShell
 #   Alt+Enter: プロパティ  Shift+Delete: 完全削除  一覧で文字入力: 頭文字ジャンプ
 #   アドレスバーに cmd / powershell / wt と入力+Enter でもその場所で端末を開く
+# ---- フォルダ検索タブ(Everything風) ----
+#   入力するそばからインデックス全体のフォルダ名を検索して一覧表示
+#   Enter/ダブルクリック: エクスプローラタブで開く  Ctrl+Enter: Explorerで開く
 # ---- 検索語の書き方(フォルダ名/ファイル名検索共通) ----
 #   スペース区切りで AND、-語 で除外、* ? を含む語はワイルドカード一致
 #   フォルダ名検索は既定で「フォルダ名そのもの」に一致(パス全体は「パス」にチェック)
+#   \ や / を含む語は常にパス全体に対して照合する
 import os
 import re
 import csv
 import sys
 import html
 import time
+import heapq
 import queue
 import bisect
 import shutil
-import fnmatch
 import zipfile
+import functools
+import unicodedata
 import threading
 import subprocess
 import tkinter as tk
@@ -56,6 +63,9 @@ LIST_DEPTH = 3
 MAX_ROWS = 2000
 MAX_LIST = 200000
 SCAN_WORKERS = 8
+FIND_DELAY_MS = 150      # フォルダ検索タブ: 入力が止まってから検索するまでの待ち
+# 上位タブの並び順(Alt+1〜4 もこの順)
+TAB_DOC, TAB_EXP, TAB_FIND, TAB_CONF = range(4)
 # インデックス作成時に潜らないシステムフォルダ(小文字)
 SKIP_DIRS = {"$recycle.bin", "system volume information", "$windows.~bt",
              "$windows.~ws", "windows.old"}
@@ -132,7 +142,7 @@ DEFAULT_FONTS = ("Yu Gothic UI", "游ゴシック", "BIZ UDPゴシック",
 
 HELP_TEXT = """【全体】
   F1                 このショートカット一覧
-  Alt+1 / 2 / 3      文書内検索 / エクスプローラ / 設定タブへ
+  Alt+1 / 2 / 3 / 4  文書内検索 / エクスプローラ / フォルダ検索 / 設定タブへ
   Ctrl+G             今いる場所を対象に文書内検索へ
   F5                 検索実行(表示中のタブに応じて)
   F6 / Shift+F6      ペイン切替(アドレス→検索→左ペイン→一覧)
@@ -142,15 +152,28 @@ HELP_TEXT = """【全体】
   Ctrl+D             参照ダイアログ
   F7 / F8            お気に入りメニュー / お気に入りに追加
   F9                 CSV出力
-  一覧: Enter=フォルダを開く  Ctrl+Enter=ファイルを開く
+  Esc                検索を停止(検索中)
+  一覧: ダブルクリック / Ctrl+Enter=ファイルを開く  Enter=フォルダを開く
   Ctrl+Shift+E       ヒットしたファイルをサクラエディタで開く
+  ※ 大文字小文字は区別しません。「全角/半角を区別しない」で ＡＢＣ と ABC、
+     ｱｲｳ と アイウ も同じとみなします。Excelは数値セルも検索対象です
+
+【フォルダ検索】(Everything風: 入力するそばから全フォルダを検索)
+  Ctrl+F / F3        検索欄へ     ↓ (検索欄)  結果一覧へ    Esc  検索欄を空に
+  Enter / ダブルクリック  エクスプローラタブでそのフォルダを開く
+  Shift+Enter        新しいタブで開く    Ctrl+Enter  Explorerで開く
+  Ctrl+C             フルパスをコピー    Ctrl+R      再検索
+  列見出しクリック   名前/場所で並べ替え(3回目で関連度順に戻る)
+  ※ 対象は設定タブの「検索ルート」から作ったインデックス(Ctrl+Shift+I で更新)
 
 【エクスプローラ】
   Ctrl+L / Alt+D     アドレスバーへ(cmd / powershell / wt と入力で端末起動)
   Ctrl+F             フォルダ名検索欄へ(全フォルダから場所探し)
-  Ctrl+E / F3        ファイル名検索欄へ(今の場所から深さN層)
+  Ctrl+E / F3        ファイル名検索欄へ(今の場所から深さN層。空欄なら通常表示)
   検索語の書き方     スペース区切り=AND  -語=除外  *や?=ワイルドカード
                      フォルダ名検索は「パス」にチェックでパス全体を対象
+                     (\\ や / を含む語は常にパス全体で照合)
+  BackSpace          フォルダ名検索の結果から開いた場所なら結果一覧へ戻る
   Ctrl+Shift+E       サクラエディタで開く
   Ctrl+Shift+C / S   この場所でコマンドプロンプト / PowerShell
   Alt+Enter          プロパティ     Shift+Delete  完全削除(ごみ箱を経由しない)
@@ -674,26 +697,36 @@ def parse_query(text):
         w = w.lower()
         if not w:
             continue
-        glob = any(c in w for c in "*?[")
+        # ワイルドカードは * ? だけ。[ ] は「[済]」のような名前の一部として扱う
+        glob = "*" in w or "?" in w
         toks.append((neg, glob, w))
     return toks
+
+
+@functools.lru_cache(maxsize=256)
+def glob_regex(w):
+    """ワイルドカード語 -> 名前全体に一致する正規表現(* と ? 以外は文字どおり)"""
+    out = []
+    for c in w:
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        else:
+            out.append(re.escape(c))
+    return re.compile("".join(out) + r"\Z", re.S)
+
+
+def match_word(hay, glob, w):
+    return glob_regex(w).match(hay) is not None if glob else w in hay
 
 
 def match_query(name_low, toks):
     """小文字化した名前が全条件を満たすか"""
     for neg, glob, w in toks:
-        if glob:
-            hit = fnmatch.fnmatchcase(name_low, w)
-        else:
-            hit = w in name_low
-        if hit == neg:
+        if match_word(name_low, glob, w) == neg:
             return False
     return True
-
-
-def query_keys(toks):
-    """絞り込みの起点にできる(除外でもワイルドカードでもない)語"""
-    return [w for neg, glob, w in toks if not neg and not glob]
 
 
 def enable_file_drop(hwnd, on_drop):
@@ -836,6 +869,39 @@ def fmt_time(t):
     return time.strftime("%Y/%m/%d %H:%M", time.localtime(t))
 
 
+def _tree_cols(tree):
+    return ("#0",) + tuple(tree["columns"])
+
+
+def col_widths(tree):
+    """一覧の列幅 -> "#0:280,kind:100,..." (設定ファイル保存用)"""
+    return ",".join("%s:%d" % (c, tree.column(c, "width"))
+                    for c in _tree_cols(tree))
+
+
+def apply_col_widths(tree, text):
+    """col_widths() で保存した列幅を戻す(壊れた値は無視)"""
+    cols = _tree_cols(tree)
+    for item in text.split(","):
+        c, _s, w = item.partition(":")
+        if c in cols and w.isdigit():
+            tree.column(c, width=max(int(w), 20))
+
+
+def autofit_column(tree, col, font):
+    """列見出しの境界をダブルクリック: 列幅を表示中の内容に合わせる"""
+    if col not in _tree_cols(tree):
+        return
+    f = tkfont.Font(font=font)
+    w = f.measure(tree.heading(col, "text")) + 30
+    # 名前列はアイコン(16)と字下げぶんを足す
+    extra = 50 if col == "#0" else 16
+    for iid in tree.get_children()[:MAX_ROWS]:
+        txt = tree.item(iid, "text") if col == "#0" else tree.set(iid, col)
+        w = max(w, f.measure(txt) + extra)
+    tree.column(col, width=min(w, 1600))
+
+
 def load_favs():
     favs = []
     try:
@@ -897,6 +963,8 @@ class ExpTab:
         self.sort_key = "name"
         self.sort_desc = False
         self.word = ""
+        self.depth = 1
+        self.search = None
         self.key = key
         self.custom = False
 
@@ -940,6 +1008,9 @@ class Pane:
         self.sort_key = "name"
         self.sort_desc = False
         self.word = ""
+        self.depth = 1            # 今の一覧を何層まで読んだか(再読込で同じ深さを使う)
+        self.search = None        # フォルダ名検索の結果表示中なら (検索語, パス全体?)
+        self.dtotal = 0           # フォルダ名検索の総ヒット数
         self.sel_target = None
         self.f_stop = threading.Event()
 
@@ -956,17 +1027,49 @@ def _pane_prop(name):
 # ============================================================
 #  フォルダ名インデックス
 # ============================================================
+def norm_root(r):
+    """検索ルートの表記をそろえる。末尾の区切りは落とすが、ドライブ直下は
+    C:\\ の形を保つ(「C:」だとドライブ直下ではなくそのドライブの
+    カレントフォルダを指してしまい、インデックスが空になるため)"""
+    r = r.strip().strip('"')
+    s = r.rstrip("\\/")
+    if len(s) == 2 and s[1] == ":":
+        return s + "\\"
+    return s or r
+
+
+def _is_junction(e):
+    """ジャンクション(マウントポイント)なら True。中へは潜らない
+    (Application Data 等の循環を避ける。OneDrive等のクラウドフォルダは対象外)"""
+    if os.name != "nt":
+        return False
+    try:
+        tag = getattr(e.stat(follow_symlinks=False), "st_reparse_tag", 0)
+    except OSError:
+        return False
+    return tag == 0xA0000003
+
+
 def scan_dirs(roots, stop, progress):
     result = []
     work = queue.Queue()
     lock = threading.Lock()
     state = {"pending": 0, "done": 0}
+    uniq = []
     for r in roots:
-        r = r.rstrip("\\/")
-        if os.path.isdir(r):
-            state["pending"] += 1
-            work.put(r)
-            result.append(r)
+        r = norm_root(r)
+        low = r.lower().rstrip("\\/")
+        if r and os.path.isdir(r) and low not in [u[1] for u in uniq]:
+            uniq.append((r, low))
+    for r, low in uniq:
+        # 別のルートの配下にあるルートは二重登録になるので除く
+        if any(low != o and (low.startswith(o + "\\")
+                             or low.startswith(o + "/"))
+               for _r, o in uniq):
+            continue
+        state["pending"] += 1
+        work.put(r)
+        result.append(r)
 
     def worker():
         while True:
@@ -979,6 +1082,7 @@ def scan_dirs(roots, stop, progress):
                     if state["pending"] == 0:
                         return
                 continue
+            found = []
             subs = []
             try:
                 with os.scandir(d) as it:
@@ -986,13 +1090,15 @@ def scan_dirs(roots, stop, progress):
                         try:
                             if e.is_dir(follow_symlinks=False) \
                                     and e.name.lower() not in SKIP_DIRS:
-                                subs.append(e.path)
+                                found.append(e.path)
+                                if not _is_junction(e):
+                                    subs.append(e.path)
                         except OSError:
                             pass
             except OSError:
                 pass
             with lock:
-                result.extend(subs)
+                result.extend(found)
                 state["pending"] += len(subs) - 1
                 state["done"] += 1
                 done = state["done"]
@@ -1023,34 +1129,34 @@ def _basename(p):
     return os.path.basename(p.rstrip("\\/")) or p
 
 
-class DirIndex:
-    """フォルダの全パス一覧。フォルダ名(末尾要素)用とパス全体用の
-    2つの検索用テキストを持ち、既定はフォルダ名そのものに一致させる"""
+def parent_of(path):
+    """フォルダのパス -> 親フォルダ(ドライブ直下などは "")"""
+    s = path.rstrip("\\/")
+    parent = os.path.dirname(s)
+    return "" if not parent or parent == s else parent
 
-    def __init__(self):
-        self.paths = []
-        self.blob = ""       # パス全体(小文字)を改行連結
-        self.starts = []
-        self.nblob = ""      # フォルダ名のみ(小文字)を改行連結
-        self.nstarts = []
 
-    def load(self):
-        self.paths = []
-        try:
-            with open(DIRIDX_FILE, "r", encoding="utf-8",
-                      errors="replace") as f:
-                self.paths = [ln.rstrip("\n") for ln in f if ln.strip()]
-        except OSError:
-            pass
-        self.rebuild()
+def _line(blob, starts, li):
+    """改行連結テキストの li 行目 -> (行の文字列, 行末位置)"""
+    end = starts[li + 1] - 1 if li + 1 < len(starts) else len(blob)
+    return blob[starts[li]:end], end
 
-    def rebuild(self):
+
+def _is_pathword(w):
+    return "\\" in w or "/" in w
+
+
+class _IndexSnap:
+    """インデックスの中身一式。検索スレッドと再スキャンが並行しても
+    食い違わないよう、作り直す時は丸ごと差し替える(中身は変更しない)"""
+
+    def __init__(self, paths):
         starts = []
         parts = []
         nstarts = []
         nparts = []
         pos = npos = 0
-        for p in self.paths:
+        for p in paths:
             low = p.lower().replace("\n", " ")
             starts.append(pos)
             parts.append(low)
@@ -1059,64 +1165,147 @@ class DirIndex:
             nstarts.append(npos)
             nparts.append(nl)
             npos += len(nl) + 1
-        self.blob = "\n".join(parts)
+        self.paths = paths
+        self.blob = "\n".join(parts)     # パス全体(小文字)を改行連結
         self.starts = starts
-        self.nblob = "\n".join(nparts)
+        self.nblob = "\n".join(nparts)   # フォルダ名のみ(小文字)を改行連結
         self.nstarts = nstarts
 
-    def _line(self, blob, starts, li):
-        n = len(starts)
-        end = starts[li + 1] - 1 if li + 1 < n else len(blob)
-        return blob[starts[li]:end], end
 
-    def search(self, query, limit, full_path=False):
-        """query: 検索欄の文字列。full_path=False ならフォルダ名のみに一致。
-        戻り値は関連度順(完全一致 > 前方一致 > 部分一致、浅い階層優先)"""
+class DirIndex:
+    """フォルダの全パス一覧。フォルダ名(末尾要素)用とパス全体用の
+    2つの検索用テキストを持ち、既定はフォルダ名そのものに一致させる"""
+
+    def __init__(self):
+        self.snap = _IndexSnap([])
+
+    @property
+    def paths(self):
+        return self.snap.paths
+
+    def load(self):
+        paths = []
+        try:
+            with open(DIRIDX_FILE, "r", encoding="utf-8",
+                      errors="replace") as f:
+                for ln in f:
+                    p = ln.rstrip("\r\n")
+                    if not p.strip():
+                        continue
+                    # 旧版の不具合で入った「C:」「C:xxx」(ドライブ直下では
+                    # なくカレントフォルダ基準の相対パス)を補正/除外
+                    if re.match(r"^[A-Za-z]:$", p):
+                        p += "\\"
+                    elif re.match(r"^[A-Za-z]:[^\\/]", p):
+                        continue
+                    paths.append(p)
+        except OSError:
+            pass
+        self.set_paths(paths)
+
+    def set_paths(self, paths):
+        self.snap = _IndexSnap(list(paths))
+
+    def search(self, query, limit, full_path=False, sort="rank",
+               desc=False, stop=None):
+        """query: 検索欄の文字列。full_path=False ならフォルダ名のみに一致
+        (\\ や / を含む語だけはパス全体に照合)。
+        sort: "rank"=関連度順(完全一致 > 前方一致 > 部分一致、浅い階層優先)
+              "name"=名前順 / "path"=パス順
+        戻り値: (総ヒット数, 並べ替え後の上位limit件のパス)。
+        stop(Event)がセットされたら中断して None を返す"""
+        s = self.snap
         toks = parse_query(query)
-        if not self.paths or not toks:
-            return []
-        if full_path:
-            blob, starts = self.blob, self.starts
-        else:
-            blob, starts = self.nblob, self.nstarts
-        keys = query_keys(toks)
+        if not s.paths or not toks:
+            return 0, []
+        # 語ごとに照合先を決める: True=パス全体 / False=フォルダ名
+        conds = [(neg, glob, w, full_path or _is_pathword(w))
+                 for neg, glob, w in toks]
+        use_name = any(not onp for _n, _g, _w, onp in conds)
+        use_path = any(onp for _n, _g, _w, onp in conds)
+
+        def ok(name, path):
+            for neg, glob, w, onp in conds:
+                if match_word(path if onp else name, glob, w) == neg:
+                    return False
+            return True
+
+        keys = [(w, onp) for neg, glob, w, onp in conds
+                if not neg and not glob]
         hits = []
         if keys:
-            key = max(keys, key=len)
+            # 一番長い語で候補行を高速に拾い、残りの条件は行ごとに確認
+            key, onp = max(keys, key=lambda k: len(k[0]))
+            blob, starts = (s.blob, s.starts) if onp else (s.nblob, s.nstarts)
             pos = 0
-            while len(hits) < limit:
+            n = 0
+            while True:
                 i = blob.find(key, pos)
                 if i < 0:
                     break
                 li = bisect.bisect_right(starts, i) - 1
-                line, end = self._line(blob, starts, li)
-                if match_query(line, toks):
+                line, end = _line(blob, starts, li)
+                name = line if not onp else (
+                    _line(s.nblob, s.nstarts, li)[0] if use_name else "")
+                path = line if onp else (
+                    _line(s.blob, s.starts, li)[0] if use_path else "")
+                if ok(name, path):
                     hits.append(li)
                 pos = end + 1
+                n += 1
+                if not n & 0xFFF and stop is not None and stop.is_set():
+                    return None
         else:
-            for li in range(len(starts)):
-                line, _e = self._line(blob, starts, li)
-                if match_query(line, toks):
+            names = s.nblob.split("\n") if use_name else None
+            lows = s.blob.split("\n") if use_path else None
+            for li in range(len(s.paths)):
+                if ok(names[li] if use_name else "",
+                      lows[li] if use_path else ""):
                     hits.append(li)
-                    if len(hits) >= limit:
-                        break
-        first = keys[0] if keys else ""
+                if not li & 0xFFF and stop is not None and stop.is_set():
+                    return None
+        total = len(hits)
+        first = next((w for neg, glob, w, onp in conds
+                      if not neg and not glob and not _is_pathword(w)), "")
 
-        def rank(li):
-            p = self.paths[li]
-            name = _basename(p).lower()
-            if not first:
-                r = 2
-            elif name == first:
-                r = 0
-            elif name.startswith(first):
-                r = 1
-            else:
-                r = 2
-            return (r, p.count("\\") + p.count("/"), p.lower())
+        def name_of(li):
+            return _line(s.nblob, s.nstarts, li)[0]
 
-        hits.sort(key=rank)
-        return [self.paths[li] for li in hits]
+        def path_of(li):
+            return _line(s.blob, s.starts, li)[0]
+
+        if sort == "name":
+            def keyf(li):
+                return (name_of(li), path_of(li))
+        elif sort == "path":
+            keyf = path_of
+        else:
+            desc = False
+
+            def keyf(li):
+                name = name_of(li)
+                p = s.paths[li]
+                if not first:
+                    r = 2
+                elif name == first:
+                    r = 0
+                elif name.startswith(first):
+                    r = 1
+                elif first in name:
+                    r = 2
+                else:
+                    r = 3        # パス側だけで一致
+                return (r, p.count("\\") + p.count("/"), len(name),
+                        path_of(li))
+
+        # 件数を絞る前に全ヒットから順位付けする(完全一致が漏れないように)
+        if total <= limit:
+            top = sorted(hits, key=keyf, reverse=desc)
+        elif desc:
+            top = heapq.nlargest(limit, hits, key=keyf)
+        else:
+            top = heapq.nsmallest(limit, hits, key=keyf)
+        return total, [s.paths[li] for li in top]
 
 
 def list_under(folder, depth, stop, out_q, pidx, gen):
@@ -1178,25 +1367,66 @@ def cli_scan():
 # ============================================================
 #  文書内検索(抽出エンジン)
 # ============================================================
-def snippets(text, word, ctx):
+def _fold_table():
+    """全角英数記号・全角スペース・半角カナを、文字数を変えずに標準形へ
+    寄せる表。長さが変わらないので、寄せた文章で見つけた位置のまま
+    元の文章から前後を切り出せる"""
+    tbl = {c: c - 0xFEE0 for c in range(0xFF01, 0xFF5F)}   # ！〜～ -> !〜~
+    tbl[0x3000] = 0x20                                     # 全角スペース
+    for c in range(0xFF61, 0xFFA0):                        # 半角カナ
+        n = unicodedata.normalize("NFKC", chr(c))
+        if len(n) == 1:
+            tbl[c] = {"\u3099": "゛", "\u309a": "゜"}.get(n, n)
+    return tbl
+
+
+FOLD_TABLE = _fold_table()
+
+
+def fold_text(text):
+    return text if text.isascii() else text.translate(FOLD_TABLE)
+
+
+def make_pattern(word, fold=True):
+    """検索語 -> 正規表現(大文字小文字は区別しない)。
+    fold=True なら全角/半角の違いも無視する(ガ は半角の ｶﾞ にも一致)"""
+    if not fold:
+        return re.compile(re.escape(word), re.I)
+    w = fold_text(word).replace("゛", "\u3099").replace("゜", "\u309a")
+    out = []
+    for ch in unicodedata.normalize("NFC", w):
+        d = unicodedata.normalize("NFD", ch)
+        if len(d) == 2 and d[1] in "\u3099\u309a":
+            # 濁音・半濁音は「カ゛」(半角カナを寄せた形)にも一致させる
+            alt = d[0] + ("゛" if d[1] == "\u3099" else "゜")
+            out.append("(?:%s|%s)" % (re.escape(ch), re.escape(alt)))
+        else:
+            out.append(re.escape(ch))
+    return re.compile("".join(out), re.I)
+
+
+def snippets(text, pat, ctx, fold=True):
+    """text 中の pat の出現ごとに前後 ctx 文字を切り出す(最大 MAX_HIT 件)"""
     res = []
-    low = text.lower()
-    w = word.lower()
-    pos = 0
-    while len(res) < MAX_HIT:
-        i = low.find(w, pos)
-        if i < 0:
-            break
-        s = max(0, i - ctx)
-        e = min(len(text), i + len(word) + ctx)
+    hay = fold_text(text) if fold else text
+    for m in pat.finditer(hay):
+        s = max(0, m.start() - ctx)
+        e = min(len(text), m.end() + ctx)
         res.append(re.sub(r"\s+", " ", text[s:e]))
-        pos = i + len(word)
+        if len(res) >= MAX_HIT:
+            break
     return res
+
+
+def _natkey(s):
+    """sheet2 < sheet10 となる並べ替えキー"""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
 
 
 def join_runs(xml, tag, para_end):
     lines = []
-    pat = re.compile("<" + tag + "[^>]*>([^<]*)</" + tag + ">")
+    # タグ名の後ろは空白か > のみ(<w:t> が <w:tab/> 等に誤一致しないように)
+    pat = re.compile("<" + tag + r"(?:\s[^>]*)?>([^<]*)</" + tag + ">")
     for para in xml.split(para_end):
         t = "".join(pat.findall(para))
         if t:
@@ -1204,25 +1434,32 @@ def join_runs(xml, tag, para_end):
     return "\n".join(lines)
 
 
+DOCX_PARTS = (
+    (r"word/document\.xml$", "本文"),
+    (r"word/(header|footer)\d+\.xml$", "ヘッダ/フッタ"),
+    (r"word/footnotes\.xml$", "脚注"),
+    (r"word/endnotes\.xml$", "文末脚注"),
+    (r"word/comments\.xml$", "コメント"),
+)
+
+
 def extract_docx(zf):
     parts = []
-    for name in zf.namelist():
-        if name == "word/document.xml":
-            label = "本文"
-        elif re.match(r"word/(header|footer)\d+\.xml$", name):
-            label = "ヘッダ/フッタ"
-        else:
-            continue
-        xml = zf.read(name).decode("utf-8", "ignore")
-        text = join_runs(xml, "w:t", "</w:p>")
-        if text:
-            parts.append((label, text))
+    names = sorted(zf.namelist(), key=_natkey)
+    for pat, label in DOCX_PARTS:
+        for name in names:
+            if not re.match(pat, name):
+                continue
+            xml = zf.read(name).decode("utf-8", "ignore")
+            text = join_runs(xml, "w:t", "</w:p>")
+            if text:
+                parts.append((label, text))
     return parts
 
 
 def extract_pptx(zf):
     parts = []
-    for name in sorted(zf.namelist()):
+    for name in sorted(zf.namelist(), key=_natkey):
         m = re.match(r"ppt/slides/slide(\d+)\.xml$", name)
         n = re.match(r"ppt/notesSlides/notesSlide(\d+)\.xml$", name)
         if not (m or n):
@@ -1235,15 +1472,18 @@ def extract_pptx(zf):
     return parts
 
 
+XL_T = re.compile(r"<t(?:\s[^>]*)?>([^<]*)</t>")
+
+
 def parse_sst(zf):
     sst = []
     try:
         xml = zf.read("xl/sharedStrings.xml").decode("utf-8", "ignore")
     except KeyError:
         return sst
-    xml = re.sub(r"<rPh.*?</rPh>", "", xml, flags=re.S)
-    for item in re.findall(r"<si>(.*?)</si>", xml, flags=re.S):
-        t = "".join(re.findall(r"<t[^>]*>([^<]*)</t>", item))
+    xml = re.sub(r"<rPh\b.*?</rPh>", "", xml, flags=re.S)
+    for item in re.findall(r"<si>(.*?)</si>|<si/>", xml, flags=re.S):
+        t = "".join(XL_T.findall(item))
         sst.append(html.unescape(t))
     return sst
 
@@ -1270,36 +1510,51 @@ def xlsx_sheet_names(zf):
 
 
 def xlsx_drawing_map(zf, names):
+    """図形(drawingN.xml)・コメント(commentsN.xml) -> 置かれているシート名"""
     dmap = {}
     for name in zf.namelist():
         m = re.match(r"xl/worksheets/_rels/(sheet\d+\.xml)\.rels$", name)
         if not m:
             continue
         rels = zf.read(name).decode("utf-8", "ignore")
-        for mt in re.findall(r'Target="[^"]*?(drawing\d+\.xml)"', rels):
+        for mt in re.findall(
+                r'Target="[^"]*?((?:drawing|comments)\d+\.xml)"', rels):
             dmap[mt] = names.get(m.group(1), m.group(1))
     return dmap
 
 
+# セル: <c ...>...</c> と空セル <c .../> の両方に対応
+# (空セルを取りこぼすと次のセルとくっついて値を読み違える)
+XL_CELL = re.compile(r"<c\b([^>]*?)(?:/>|>(.*?)</c>)", re.S)
+XL_TYPE = re.compile(r'\bt="(\w+)"')
+XL_V = re.compile(r"<v>([^<]*)</v>")
+
+
 def extract_sheet(xml, sst):
     texts = []
-    for cell in re.findall(r"<c [^>]*?>.*?</c>", xml, flags=re.S):
-        m = re.search(r'\st="(\w+)"', cell)
-        t = m.group(1) if m else ""
-        if t == "s":
-            v = re.search(r"<v>(\d+)</v>", cell)
-            if v:
-                i = int(v.group(1))
-                if i < len(sst) and sst[i]:
-                    texts.append(sst[i])
-        elif t == "inlineStr":
-            s = "".join(re.findall(r"<t[^>]*>([^<]*)</t>", cell))
+    for attrs, body in XL_CELL.findall(xml):
+        if not body:
+            continue
+        m = XL_TYPE.search(attrs)
+        t = m.group(1) if m else "n"
+        if t == "inlineStr":
+            s = "".join(XL_T.findall(body))
             if s:
                 texts.append(html.unescape(s))
-        elif t == "str":
-            v = re.search(r"<v>([^<]*)</v>", cell)
-            if v and v.group(1):
-                texts.append(html.unescape(v.group(1)))
+            continue
+        v = XL_V.search(body)
+        if not v or not v.group(1):
+            continue
+        if t == "s":
+            try:
+                i = int(v.group(1))
+            except ValueError:
+                continue
+            if i < len(sst) and sst[i]:
+                texts.append(sst[i])
+        elif t in ("str", "n", "d"):
+            # 数式の文字列結果 / 数値 / 日付(ISO形式)。数値もExcelの検索同様に対象
+            texts.append(html.unescape(v.group(1)))
     return "\n".join(texts)
 
 
@@ -1308,43 +1563,63 @@ def extract_xlsx(zf):
     sst = parse_sst(zf)
     names = xlsx_sheet_names(zf)
     dmap = xlsx_drawing_map(zf, names)
-    for name in sorted(zf.namelist()):
+    order = {f: i for i, f in enumerate(names)}    # ブック上のシートの並び
+
+    def key(name):
+        base = name.rsplit("/", 1)[-1]
+        return (order.get(base, len(order)), _natkey(name))
+
+    for name in sorted(zf.namelist(), key=key):
         m = re.match(r"xl/worksheets/(sheet\d+\.xml)$", name)
         d = re.match(r"xl/drawings/(drawing\d+\.xml)$", name)
+        c = re.match(r"xl/(comments\d+\.xml)$", name)
         if m:
             xml = zf.read(name).decode("utf-8", "ignore")
             text = extract_sheet(xml, sst)
             if text:
                 parts.append((names.get(m.group(1), m.group(1)), text))
-        elif d:
+        elif d or c:
             xml = zf.read(name).decode("utf-8", "ignore")
-            text = join_runs(xml, "a:t", "</a:p>")
+            if d:
+                text = join_runs(xml, "a:t", "</a:p>")
+                kind = "図形"
+            else:
+                text = join_runs(xml, "t", "</comment>")
+                kind = "コメント"
             if text:
-                sheet = dmap.get(d.group(1), "")
-                label = "図形(" + sheet + ")" if sheet else "図形"
+                sheet = dmap.get((d or c).group(1), "")
+                label = kind + "(" + sheet + ")" if sheet else kind
                 parts.append((label, text))
     return parts
 
 
 def read_text(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", "replace")      # BOM付きUTF-16(Unicodeテキスト)
     for enc in ("utf-8-sig", "cp932"):
         try:
-            with open(path, "r", encoding=enc) as f:
-                return f.read()
+            return data.decode(enc)
         except UnicodeDecodeError:
             pass
-    with open(path, "r", encoding="cp932", errors="replace") as f:
-        return f.read()
+    return data.decode("cp932", "replace")
 
 
-def search_worker(folder, word, ctx, excludes, exts, q):
+def search_worker(folder, word, ctx, excludes, exts, q, stop=None,
+                  fold=True):
     n_files = n_hits = n_err = 0
+    pat = make_pattern(word, fold)
     for root, dirs, files in os.walk(folder):
+        if stop is not None and stop.is_set():
+            break
         dirs[:] = [d for d in dirs
                    if not d.startswith((".", "$"))
                    and not any(x in os.path.join(root, d).lower()
                                for x in excludes)]
         for fn in files:
+            if stop is not None and stop.is_set():
+                break
             if fn.startswith("~$"):
                 continue
             path = os.path.join(root, fn)
@@ -1368,7 +1643,7 @@ def search_worker(folder, word, ctx, excludes, exts, q):
                 n_files += 1
                 folder_path = os.path.dirname(path)
                 for label, text in parts:
-                    for frag in snippets(text, word, ctx):
+                    for frag in snippets(text, pat, ctx, fold):
                         n_hits += 1
                         q.put(("hit", path, fn, folder_path, label, frag))
             except Exception as e:
@@ -1437,6 +1712,17 @@ class App:
         self._ta_buf = ""
         self._ta_time = 0.0
         self.scan_stop = threading.Event()
+        self.doc_stop = threading.Event()
+        # フォルダ検索タブ(Everything風)の状態
+        self.find_paths = {}
+        self.find_sort = ("rank", False)
+        self._find_gen = 0
+        self._find_stop = threading.Event()
+        self._find_job = None
+        self._find_shown = None       # 表示中の結果の検索条件
+        self._find_running = None     # 実行中の検索の検索条件
+        self._find_focus_after = False
+        self.dmenu_iid = ""
         self.style = ttk.Style(root)
         self.families = jp_font_families(root)
         self.icons = build_icons()
@@ -1447,9 +1733,11 @@ class App:
         self.nb.pack(fill="both", expand=True)
         self.tab1 = ttk.Frame(self.nb)
         self.tabf = ttk.Frame(self.nb)
+        self.tabd = ttk.Frame(self.nb)
         tab2 = ttk.Frame(self.nb)
         self.nb.add(self.tab1, text=" 文書内検索 ")
         self.nb.add(self.tabf, text=" エクスプローラ ")
+        self.nb.add(self.tabd, text=" フォルダ検索 ")
         self.nb.add(tab2, text=" 設定 ")
         self.nb.bind("<<NotebookTabChanged>>", self.on_tab_change)
         tab1 = self.tab1
@@ -1484,8 +1772,15 @@ class App:
                                textvariable=self.var_ctx, width=5)
         self.spin.pack(side="left", padx=2)
         ttk.Label(wrap, text="文字").pack(side="left")
+        self.var_fold = tk.BooleanVar(value=conf.get("fold", "1") == "1")
+        chk_fold = ttk.Checkbutton(wrap, text="全角/半角を区別しない",
+                                   variable=self.var_fold,
+                                   command=self.save_conf)
+        chk_fold.pack(side="left", padx=(12, 0))
+        Tip(chk_fold, "ON: ＡＢＣ と ABC、ｱｲｳ と アイウ を同じ文字とみなす\n"
+                      "(大文字小文字はいつも区別しません)")
         self.btn = ttk.Button(top, text="検索(F5)", style="Accent.TButton",
-                              command=self.start)
+                              command=self.toggle_doc_search)
         self.btn.grid(row=1, column=2, pady=6)
         ttk.Button(top, text="CSV出力(F9)", command=self.export_csv).grid(
             row=1, column=3, padx=6)
@@ -1512,26 +1807,36 @@ class App:
         self.tree.heading("dir", text="フォルダ")
         self.tree.heading("where", text="場所")
         self.tree.heading("ctx", text="前後の文脈")
-        self.tree.column("#0", width=200)
-        self.tree.column("dir", width=250)
-        self.tree.column("where", width=100, anchor="center")
-        self.tree.column("ctx", width=420)
+        # 列幅: 伸縮(stretch)する列はマウスを離した時にTkが幅を配り直して
+        # しまうため、手で変える列は stretch=False。余白は最後の文脈列で吸収
+        self.tree.column("#0", width=200, minwidth=60, stretch=False)
+        self.tree.column("dir", width=250, minwidth=60, stretch=False)
+        self.tree.column("where", width=100, minwidth=40, anchor="center",
+                         stretch=False)
+        self.tree.column("ctx", width=420, minwidth=150, stretch=True)
         vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="left", fill="y")
-        self.tree.bind("<Button-1>", self.on_click)
+        hsb = ttk.Scrollbar(mid, orient="horizontal",
+                            command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="we")
+        mid.rowconfigure(0, weight=1)
+        mid.columnconfigure(0, weight=1)
+        self.tree.bind("<Double-1>", self.on_dblclick)
         self.tree.bind("<Button-3>", self.on_rclick)
         self.tree.bind("<Return>", self.on_tree_folder)
         self.tree.bind("<Control-Return>", self.on_tree_file)
         self.tree.bind("<App>", self.on_menu_key)
         self.tree.bind("<Shift-F10>", self.on_menu_key)
+        for w in (self.ent_dir, self.ent_word, self.ent_ex, self.tree):
+            w.bind("<Escape>", self.on_doc_escape)
 
         self.menu = tk.Menu(root, tearoff=0)
         self.menu.add_command(label="フォルダを開く (Enter)",
                               command=lambda: self.open_folder_of(
                                   self.menu_iid))
-        self.menu.add_command(label="ファイルを開く (Ctrl+Enter)",
+        self.menu.add_command(label="ファイルを開く (ダブルクリック / Ctrl+Enter)",
                               command=lambda: self.open_file_of(
                                   self.menu_iid))
         self.menu.add_separator()
@@ -1597,7 +1902,7 @@ class App:
         self.var_dpath = tk.BooleanVar(value=conf.get("dpath", "0") == "1")
         self.chk_dpath = ttk.Checkbutton(ftop, text="パス",
                                          variable=self.var_dpath,
-                                         command=self.save_conf)
+                                         command=self.on_dpath_toggle)
         self.chk_dpath.pack(side="left", padx=(2, 0))
         Tip(self.chk_dpath, "ON: パス全体に含まれれば一致\n"
                             "OFF: フォルダ名そのものに含まれる場合だけ一致")
@@ -1609,14 +1914,20 @@ class App:
         self.ent_fword.bind("<Return>", self.fsearch_file)
         self.ent_fword.bind("<Escape>", self.on_entry_escape)
         Tip(self.ent_fword, "今の場所から深さN層の名前を探す (Ctrl+E)\n"
-                            "スペース=AND  -語=除外  *.xlsx などワイルドカード可")
+                            "スペース=AND  -語=除外  *.xlsx などワイルドカード可\n"
+                            "空欄でEnterなら通常の一覧に戻る")
         ttk.Label(ftop, text=" 深さ").pack(side="left")
         self.var_depth = tk.StringVar(value=str(LIST_DEPTH))
         self.dspin = tk.Spinbox(ftop, from_=1, to=10, width=3,
                                 textvariable=self.var_depth)
         self.dspin.pack(side="left", padx=2)
-        ttk.Button(ftop, text="検索(F5)", style="Accent.TButton",
-                   command=self.fsearch).pack(side="left", padx=(6, 0))
+        # takefocus=False: クリックしても入力欄のフォーカスを奪わない。
+        # 奪うと「どちらの欄で検索したか」が分からず、フォルダ名を入れて
+        # 押してもファイル名検索(=深さN層の全件表示)が走ってしまう
+        b_fs = ttk.Button(ftop, text="検索(F5)", style="Accent.TButton",
+                          takefocus=False, command=self.fsearch)
+        b_fs.pack(side="left", padx=(6, 0))
+        Tip(b_fs, "カーソルのある欄(フォルダ名/ファイル名)で検索")
 
         gold3 = tk.Frame(self.tabf, height=1)
         gold3.pack(fill="x", padx=10)
@@ -1732,6 +2043,9 @@ class App:
         self.tmenu.add_command(label="タブを閉じる (Ctrl+W)",
                                command=lambda: self.tab_act("close"))
 
+        # ================= フォルダ検索タブ(Everything風) =================
+        gold4 = self.build_find_tab(conf)
+
         # ================= 設定タブ =================
         trow = ttk.Frame(tab2)
         trow.pack(anchor="w", padx=14, pady=(12, 2))
@@ -1803,8 +2117,8 @@ class App:
             anchor="w", padx=14, pady=4)
 
         ttk.Label(tab2, padding=(8, 10, 8, 0),
-                  text="エクスプローラの検索ルート（1行に1つ。例: "
-                       r"\\server\share や D:\projects）"
+                  text="フォルダ名検索/フォルダ検索タブの検索ルート（1行に1つ。例: "
+                       r"C:\ や \\server\share や D:\projects）"
                   ).pack(anchor="w")
         self.roots_text = tk.Text(tab2, width=70, height=3)
         self.roots_text.pack(anchor="w", padx=14)
@@ -1837,13 +2151,20 @@ class App:
 
         gold2 = tk.Frame(root, height=1)
         gold2.pack(fill="x")
-        self.gold_lines = [gold1, gold2, gold3]
+        self.gold_lines = [gold1, gold2, gold3, gold4]
         self.spins = [self.spin, self.fspin, self.dspin]
         self.texts = [self.ext_text, self.fav_text, self.roots_text]
         self.font_widgets = [self.ent_dir, self.ent_word, self.ent_ex,
                              self.ent_addr, self.ent_dword, self.ent_fword,
                              self.ent_side, self.cb_theme, cb_font,
-                             self.ent_editor]
+                             self.ent_editor, self.ent_find]
+        # 列幅の保存/復元の対象(設定ファイルのキー -> 一覧)
+        self.col_trees = {"cols_doc": self.tree,
+                          "cols_exp0": self.panes[0].tree,
+                          "cols_exp1": self.panes[1].tree,
+                          "cols_find": self.dtree}
+        for key, tr in self.col_trees.items():
+            apply_col_widths(tr, conf.get(key, ""))
         self.status = tk.StringVar(value="待機中")
         ttk.Label(root, textvariable=self.status, anchor="w",
                   style="Status.TLabel", padding=(10, 5)).pack(fill="x")
@@ -1880,9 +2201,9 @@ class App:
         root.bind("<Control-Shift-O>", lambda e: self.save_fav_edit())
         root.bind("<Control-Shift-I>", lambda e: self.full_scan())
         root.bind("<Control-Shift-P>", lambda e: self.stop_scan())
-        root.bind("<Alt-Key-1>", lambda e: self.goto_main_tab(0))
-        root.bind("<Alt-Key-2>", lambda e: self.goto_main_tab(1))
-        root.bind("<Alt-Key-3>", lambda e: self.goto_main_tab(2))
+        for i in range(4):
+            root.bind("<Alt-Key-%d>" % (i + 1),
+                      lambda e, ii=i: self.goto_main_tab(ii))
         root.bind("<Control-g>", lambda e: self.grep_here())
         root.bind("<Control-b>", lambda e: self.focus_side_filter())
         root.bind("<Control-o>", lambda e: self.focus_side_key())
@@ -1905,8 +2226,9 @@ class App:
             p1.scope_dir = self.panes[0].scope_dir
             self.start_list(p1.scope_dir, 1, pane=p1)
         self.update_pane_marks()
+        self.update_find_info()
         self.root.after(300, self.setup_drop)
-        self.root.after(150, self.poll_fq)
+        self.root.after(100, self.poll_fq)
 
     # ---------- ペインの構築/切替 ----------
     def build_pane(self, parent, p):
@@ -1922,11 +2244,18 @@ class App:
             p.tree.heading(self.colid[k], text=self.head_base[k],
                            command=lambda kk=k, pp=p:
                            self.sort_by_pane(pp, kk))
-        p.tree.column("#0", width=280, minwidth=160)
-        p.tree.column("kind", width=100, anchor="center", stretch=False)
-        p.tree.column("size", width=80, anchor="e", stretch=False)
-        p.tree.column("mtime", width=130, anchor="center", stretch=False)
-        p.tree.column("path", width=400, stretch=False)
+        # 全列 stretch=False(Explorer同様、列幅は手で決めた値のまま)。
+        # 伸縮する列があると、境界をドラッグしてマウスを離した瞬間に
+        # Tk(ttk::treeview の drop 処理)がその列へ幅を配り直すため、
+        # 名前列の幅は元に戻り、他の列を広げても名前列が縮んで境界が戻ってしまう
+        p.tree.column("#0", width=280, minwidth=60, stretch=False)
+        p.tree.column("kind", width=100, minwidth=30, anchor="center",
+                      stretch=False)
+        p.tree.column("size", width=80, minwidth=30, anchor="e",
+                      stretch=False)
+        p.tree.column("mtime", width=130, minwidth=30, anchor="center",
+                      stretch=False)
+        p.tree.column("path", width=400, minwidth=30, stretch=False)
         vsb = ttk.Scrollbar(p.frame, orient="vertical",
                             command=p.tree.yview)
         hsb = ttk.Scrollbar(p.frame, orient="horizontal",
@@ -1939,7 +2268,7 @@ class App:
         p.frame.columnconfigure(0, weight=1)
         t = p.tree
         t.bind("<Button-1>", lambda e, pp=p: self.on_tree_click(pp, e))
-        t.bind("<Double-1>", self.on_ftree_enter)
+        t.bind("<Double-1>", self.on_ftree_dblclick)
         t.bind("<Button-3>", self.on_frclick)
         t.bind("<Return>", self.on_ftree_enter)
         t.bind("<Control-Return>", self.on_ftree_place)
@@ -1982,6 +2311,8 @@ class App:
         p = self.panes[idx]
         self.var_addr.set(p.scope_dir or "")
         self.var_fword.set(p.word)
+        if p.scope_dir is None and p.search:
+            self.var_dword.set(p.search[0])
         self.update_headings(p)
         self.update_pane_marks()
 
@@ -1991,7 +2322,11 @@ class App:
             if p.label is not None:
                 p.label.configure(style="PaneHdrOn.TLabel" if on
                                   else "PaneHdr.TLabel")
-                p.var_label.set(" " + (p.scope_dir or "ホーム"))
+                if p.scope_dir is None and p.search:
+                    txt = "フォルダ名検索: " + p.search[0]
+                else:
+                    txt = p.scope_dir or "ホーム"
+                p.var_label.set(" " + txt)
 
     def on_tree_click(self, p, event):
         self.set_active(p.idx)
@@ -2026,7 +2361,10 @@ class App:
     def reload_pane(self, idx):
         p = self.panes[idx]
         if p.scope_dir:
-            self.start_list(p.scope_dir, 1, pane=p)
+            # ファイル名検索中なら同じ深さで読み直す(1層だと結果が欠ける)
+            self.start_list(p.scope_dir, p.depth, pane=p)
+        elif p.search:
+            self.run_dsearch(p, *p.search)
         elif idx == self.cur_pane:
             self._home_fill()
 
@@ -2134,7 +2472,7 @@ class App:
         self.update_pane_marks()
 
     def new_folder(self):
-        if self.cur_tab() != 1:
+        if self.cur_tab() != TAB_EXP:
             return
         p = self.panes[self.cur_pane]
         if not p.scope_dir:
@@ -2163,7 +2501,7 @@ class App:
                 self.reload_pane(pp.idx)
 
     def do_f2(self):
-        if self.cur_tab() == 1:
+        if self.cur_tab() == TAB_EXP:
             self.rename_sel()
         else:
             self.focus_widget(self.ent_dir)
@@ -2245,26 +2583,39 @@ class App:
             return 0
 
     def on_tab_change(self, event=None):
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab in (TAB_EXP, TAB_FIND):
             self.ensure_index()
+        if tab == TAB_FIND:
+            self.update_find_info()
+            self.root.after_idle(self.focus_find_default)
 
     def do_primary(self):
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             self.fsearch()
+        elif tab == TAB_FIND:
+            self.run_find()
         else:
             self.start()
 
     def focus_word(self):
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             self.ent_fword.focus_set()
             self.ent_fword.select_range(0, "end")
+        elif tab == TAB_FIND:
+            self.focus_find_entry()
         else:
             self.focus_widget(self.ent_word)
 
     def focus_dword(self):
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             self.ent_dword.focus_set()
             self.ent_dword.select_range(0, "end")
+        elif tab == TAB_FIND:
+            self.focus_find_entry()
         else:
             self.focus_widget(self.ent_word)
 
@@ -2274,8 +2625,11 @@ class App:
         self.ent_addr.select_range(0, "end")
 
     def refresh_list(self):
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             self.reload_pane(self.cur_pane)
+        elif tab == TAB_FIND:
+            self.run_find()
 
     def focus_side(self):
         kids = self.side.get_children()
@@ -2297,7 +2651,18 @@ class App:
         t.focus_set()
 
     def cycle_pane(self, back=False):
-        if self.cur_tab() != 1:
+        tab = self.cur_tab()
+        if tab == TAB_FIND:
+            try:
+                cur = self.root.focus_get()
+            except (KeyError, tk.TclError):
+                cur = None
+            if cur is self.dtree:
+                self.focus_find_entry()
+            else:
+                self.focus_find_list()
+            return
+        if tab != TAB_EXP:
             self.focus_cur_tree()
             return
         order = [self.ent_addr, self.ent_dword, self.ent_fword,
@@ -2327,25 +2692,31 @@ class App:
                 pass
 
     def focus_cur_tree(self):
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             self.focus_flist()
+        elif tab == TAB_FIND:
+            self.focus_find_list()
         else:
             self.focus_tree()
 
     def goto_main_tab(self, i):
-        """Alt+1/2/3: 上位タブへ直接ジャンプし、適切な場所にフォーカス"""
+        """Alt+1〜4: 上位タブへ直接ジャンプし、適切な場所にフォーカス"""
         self.nb.select(i)
-        if i == 0:
+        if i == TAB_DOC:
             self.ent_word.focus_set()
             self.ent_word.select_range(0, "end")
-        elif i == 1:
+        elif i == TAB_EXP:
             self.focus_flist()
+        elif i == TAB_FIND:
+            self.focus_find_entry()
         else:
             self.cb_theme.focus_set()
 
     def grep_here(self):
         """Ctrl+G: 今いる場所を文書内検索のフォルダにセットして検索へ"""
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             iid = self.ftree.focus()
             path = self.fpaths.get(iid)
             if path:
@@ -2355,6 +2726,10 @@ class App:
                 target = self.scope_dir
             if target:
                 self.var_dir.set(target)
+        elif tab == TAB_FIND:
+            path = self.find_focus_path()
+            if path:
+                self.var_dir.set(path)
         self.nb.select(self.tab1)
         self.ent_word.focus_set()
         self.ent_word.select_range(0, "end")
@@ -2362,18 +2737,18 @@ class App:
                         + (self.var_dir.get() or "未設定"))
 
     def focus_side_key(self):
-        if self.cur_tab() == 1:
+        if self.cur_tab() == TAB_EXP:
             self.focus_side()
 
     def focus_list_key(self):
-        if self.cur_tab() == 1:
+        if self.cur_tab() == TAB_EXP:
             self.focus_flist()
 
     # ---------- エクスプローラ: タブ ----------
     def save_tab_state(self):
+        # 絞り込み語は「検索を実行した語」(p.word)を保存する。入力欄に
+        # 打っただけの語を保存すると、戻った時に意図せず絞り込まれるため
         p = self.panes[self.cur_pane]
-        w = self.var_fword.get()
-        p.word = w
         t = self.etabs[self.cur_et]
         t.scope_dir = p.scope_dir
         t.scope = p.scope
@@ -2381,7 +2756,9 @@ class App:
         t.hist_fwd = p.hist_fwd
         t.sort_key = p.sort_key
         t.sort_desc = p.sort_desc
-        t.word = w
+        t.word = p.word
+        t.depth = p.depth
+        t.search = p.search
 
     def apply_tab(self, i):
         self.cur_et = i
@@ -2395,17 +2772,21 @@ class App:
         p.sort_key = t.sort_key
         p.sort_desc = t.sort_desc
         p.word = t.word
+        p.depth = t.depth
+        p.search = t.search
         self.var_fword.set(t.word)
         self.var_addr.set(t.scope_dir or "")
         self.update_headings(p)
         self.rebuild_tabbar()
         self.update_pane_marks()
-        if t.scope_dir is None:
+        if t.scope_dir is None and not t.search:
             self._home_fill()
         elif t.scope:
             self.display()
+        elif t.scope_dir is None:
+            self.run_dsearch(p, *t.search)
         else:
-            self.start_list(t.scope_dir, 1)
+            self.start_list(t.scope_dir, t.depth)
 
     def switch_tab(self, i):
         if i == self.cur_et or not (0 <= i < len(self.etabs)):
@@ -2532,6 +2913,7 @@ class App:
             self.save_tab_state()
             nt = ExpTab(t.name, t.scope_dir)
             nt.custom = t.custom
+            nt.search = t.search
             self.etabs.insert(idx + 1, nt)
             self.apply_tab(idx + 1)
             self.save_tabs()
@@ -2542,18 +2924,23 @@ class App:
         try:
             with open(TABS_FILE, "w", encoding="utf-8") as f:
                 for t in self.etabs:
-                    f.write("\t".join([t.name, t.scope_dir or "", t.key,
+                    # 検索結果は保存しない(次回起動時はホーム)
+                    name = t.name if (t.custom or t.scope_dir) else "ホーム"
+                    f.write("\t".join([name, t.scope_dir or "", t.key,
                                        "1" if t.custom else "0"]) + "\n")
         except OSError:
             pass
 
     def sync_tab_name(self):
         t = self.etabs[self.cur_et]
+        p = self.panes[self.cur_pane]
         t.scope_dir = self.scope_dir
         if not t.custom:
             if self.scope_dir:
                 t.name = (os.path.basename(self.scope_dir.rstrip("\\/"))
                           or self.scope_dir)
+            elif p.search:
+                t.name = "検索: " + p.search[0]
             else:
                 t.name = "ホーム"
         self.rebuild_tabbar()
@@ -2598,12 +2985,22 @@ class App:
             add(name, p)
         self.scope = rows
         self.display("ホーム: 検索ルート・ユーザーフォルダ・ドライブ。"
-                     "フォルダ名検索(Ctrl+F)で全フォルダから場所を探せます")
+                     "フォルダ名検索(Ctrl+F)やフォルダ検索タブ(Alt+3)で"
+                     "全フォルダから場所を探せます")
+
+    def cur_loc(self):
+        """履歴に積む「今の場所」: フォルダのパス / None(ホーム) /
+        ("?", 検索語, パス全体?)(フォルダ名検索の結果一覧)"""
+        p = self.panes[self.cur_pane]
+        if p.scope_dir is None and p.search:
+            return ("?",) + tuple(p.search)
+        return p.scope_dir
 
     def _home(self):
         self.remember_pos()
         self.invalidate()
         self.scope_dir = None
+        self.panes[self.cur_pane].search = None
         self.var_addr.set("")
         self.panes[self.cur_pane].word = ""
         self.var_fword.set("")
@@ -2618,11 +3015,15 @@ class App:
         if target is None:
             self._home()
             return
+        if isinstance(target, tuple):     # フォルダ名検索の結果へ戻る/進む
+            self.show_dsearch(target[1], target[2])
+            return
         if not os.path.isdir(target):
             self.status.set("フォルダが存在しません: " + str(target) +
                             "（インデックスが古い可能性）")
             return
         self.scope_dir = target
+        self.panes[self.cur_pane].search = None
         self.var_addr.set(target)
         self.panes[self.cur_pane].word = ""
         self.var_fword.set("")
@@ -2639,13 +3040,13 @@ class App:
                             "（右クリック→再スキャンで直せます）")
             return
         if push:
-            self.hist_back.append(self.scope_dir)
+            self.hist_back.append(self.cur_loc())
             self.hist_fwd.clear()
         self._goto(path)
 
     def go_home(self, push=True):
         if push:
-            self.hist_back.append(self.scope_dir)
+            self.hist_back.append(self.cur_loc())
             self.hist_fwd.clear()
         self.focus_list = True
         self.sel_target = self.scope_dir
@@ -2655,7 +3056,7 @@ class App:
         if not self.hist_back:
             return
         t = self.hist_back.pop()
-        self.hist_fwd.append(self.scope_dir)
+        self.hist_fwd.append(self.cur_loc())
         self.focus_list = True
         self.sel_target = self.scope_dir
         self._goto(t)
@@ -2664,7 +3065,7 @@ class App:
         if not self.hist_fwd:
             return
         t = self.hist_fwd.pop()
-        self.hist_back.append(self.scope_dir)
+        self.hist_back.append(self.cur_loc())
         self.focus_list = True
         self._goto(t)
 
@@ -2672,7 +3073,9 @@ class App:
         if not self.scope_dir:
             return
         parent = os.path.dirname(self.scope_dir.rstrip("\\/"))
-        if parent and parent != self.scope_dir:
+        if len(parent) == 2 and parent[1] == ":":
+            parent += "\\"     # 「C:」はドライブ直下ではないので C:\ にする
+        if parent and parent.rstrip("\\/") != self.scope_dir.rstrip("\\/"):
             self.sel_target = self.scope_dir
             self.navigate(parent)
 
@@ -2722,6 +3125,7 @@ class App:
         p.f_stop.set()
         p.f_stop = threading.Event()
         p.scope = []
+        p.depth = depth
         if p.idx == self.cur_pane:
             self.status.set("読み込み中...")
         threading.Thread(target=list_under,
@@ -2759,9 +3163,9 @@ class App:
             cur = self.root.focus_get()
         except (KeyError, tk.TclError):
             cur = None
-        if cur is self.ent_dword:
+        if cur in (self.ent_dword, self.chk_dpath):
             self.fsearch_folder()
-        elif cur is self.ent_fword:
+        elif cur in (self.ent_fword, self.dspin):
             self.fsearch_file()
         elif self.scope_dir is None:
             self.fsearch_folder()
@@ -2770,57 +3174,88 @@ class App:
 
     def fsearch_folder(self, event=None):
         """フォルダ名検索: 事前一覧化したインデックス全体から場所を探す"""
-        query = self.var_dword.get()
+        query = self.var_dword.get().strip()
         if not parse_query(query):
             self.status.set("フォルダ名検索: 語を入れてEnter"
                             "（スペース=AND  -語=除外  *?=ワイルドカード）")
             self.focus_dword()
             return "break"
+        self.show_dsearch(query, bool(self.var_dpath.get()), push=True)
+        return "break"
+
+    def show_dsearch(self, query, full, push=False):
+        """フォルダ名検索の結果一覧をアクティブなペインに出す。
+        push=True なら今の場所を履歴に積む(BackSpaceで戻れる)"""
         if self.idx_state != "ready":
             # インデックス読込完了後に自動で検索を続行する
-            self._pending_fsearch = True
+            self._pending_fsearch = (query, full, push)
             self.ensure_index()
             if self.idx_state == "loading":
                 self.status.set("インデックス読込中... 完了後に検索します")
-            return "break"
+            return
+        p = self.panes[self.cur_pane]
         self.remember_pos()
-        self.invalidate()
-        if self.scope_dir is not None:
-            self.hist_back.append(self.scope_dir)
+        loc = self.cur_loc()
+        if push and loc != ("?", query, full):
+            self.hist_back.append(loc)
             self.hist_fwd.clear()
+        self.invalidate()
         self.scope_dir = None
+        p.search = (query, full)
+        p.word = ""
         self.var_addr.set("")
-        self.panes[self.cur_pane].word = ""
         self.var_fword.set("")
-        self.sync_tab_name()
-        self.update_pane_marks()
-        full = bool(self.var_dpath.get())
-        hits = self.index.search(query, 5000, full_path=full)
-        # 7要素目=関連度順位。sort_key="rank" の間はこの順で表示する
-        self.scope = [("フォルダ", _basename(p), p, _basename(p).lower(),
-                       -1, 0, i) for i, p in enumerate(hits)]
+        self.var_dword.set(query)
         self.sort_key = "rank"
         self.sort_desc = False
         self.focus_list = True
-        what = "パス全体" if full else "フォルダ名"
-        self.display("%sヒット: %d件（関連度順・列見出しで並べ替え可・"
-                     "Enterで中へ・BackSpaceで元の場所へ）"
-                     % (what, len(self.scope)))
-        return "break"
+        self.sync_tab_name()
+        self.update_pane_marks()
+        self.run_dsearch(p, query, full)
+
+    def run_dsearch(self, p, query, full):
+        """フォルダ名検索を裏で実行(大きなインデックスでも画面が固まらない)"""
+        self.gen_seq += 1
+        p.gen = gen = self.gen_seq
+        p.f_stop.set()
+        p.f_stop = stop = threading.Event()
+        p.scope = []
+        if p.idx == self.cur_pane:
+            self.status.set("フォルダ名検索中...")
+        index = self.index
+
+        def work():
+            res = index.search(query, MAX_ROWS, full_path=full, stop=stop)
+            if res is not None:
+                self.fq.put(("dsdone", p.idx, gen, res[0], res[1]))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_dpath_toggle(self):
+        """「パス」の切替: 検索結果を表示中なら新しい条件で出し直す"""
+        self.save_conf()
+        p = self.panes[self.cur_pane]
+        if p.scope_dir is None and p.search:
+            self.show_dsearch(p.search[0], bool(self.var_dpath.get()))
 
     def fsearch_file(self, event=None):
-        """ファイル名検索: 今いる場所から深さN層のファイル名を探す"""
+        """ファイル名検索: 今いる場所から深さN層のファイル名を探す。
+        語が空なら通常の一覧(1層)に戻す"""
         if self.scope_dir is None:
             self.status.set("ファイル名検索はフォルダに入ってから。"
                             "場所探しはフォルダ名検索(Ctrl+F)で")
             return "break"
-        self.panes[self.cur_pane].word = self.var_fword.get()
-        try:
-            depth = int(self.var_depth.get())
-        except ValueError:
-            depth = LIST_DEPTH
-        depth = max(1, min(10, depth))
-        self.var_depth.set(str(depth))
+        word = self.var_fword.get().strip()
+        self.panes[self.cur_pane].word = word
+        if parse_query(word):
+            try:
+                depth = int(self.var_depth.get())
+            except ValueError:
+                depth = LIST_DEPTH
+            depth = max(1, min(10, depth))
+            self.var_depth.set(str(depth))
+        else:
+            depth = 1
         self.focus_list = True
         self.start_list(self.scope_dir, depth)
         return "break"
@@ -2836,9 +3271,17 @@ class App:
             rows = [r for r in rows if match_query(r[3], toks)]
         rows = self.sort_rows(rows, p)
         if note is None:
-            if toks:
-                note = "名前ヒット: %d 件（深さ%s層まで・フォルダ含む）" % (
-                    len(rows), self.var_depth.get())
+            if p.scope_dir is None and p.search:
+                what = "パス全体" if p.search[1] else "フォルダ名"
+                total = max(p.dtotal, len(rows))
+                note = ("%sヒット: %d件（関連度順・列見出しで並べ替え可・"
+                        "Enterで中へ・BackSpaceで元の場所へ）"
+                        % (what, total))
+                if total > len(rows):
+                    note += "（上位%d件を表示・語を足して絞込）" % len(rows)
+            elif toks:
+                note = "名前ヒット: %d 件（深さ%d層まで・フォルダ含む）" % (
+                    len(rows), p.depth)
             else:
                 note = "%d 件" % len(rows)
         self.fill_ftree(p, rows, note if active else "")
@@ -2913,8 +3356,9 @@ class App:
             p.tree.heading(self.colid[c], text=base + mark)
 
     def fill_ftree(self, p, rows, note=""):
-        for i in p.tree.get_children():
-            p.tree.delete(i)
+        kids = p.tree.get_children()
+        if kids:
+            p.tree.delete(*kids)
         p.fpaths = {}
         p.fkind = {}
         shown = 0
@@ -2942,8 +3386,14 @@ class App:
             self.status.set(note)
 
     def poll_fq(self):
+        # 1回の処理時間に上限を設け、大量の一覧読込中も画面が固まらないようにする
+        deadline = time.time() + 0.08
+        busy = False
         try:
             while True:
+                if time.time() > deadline:
+                    busy = True
+                    break
                 msg = self.fq.get_nowait()
                 k = msg[0]
                 if k == "item":
@@ -2973,6 +3423,21 @@ class App:
                     for pp in self.panes:
                         if pp.scope_dir in dirs:
                             self.reload_pane(pp.idx)
+                elif k == "dsdone":
+                    _, pidx, g, total, hits = msg
+                    p = self.panes[pidx]
+                    if g != p.gen or not p.search:
+                        continue
+                    # 7要素目=関連度順位。sort_key="rank" の間はこの順で表示する
+                    p.scope = [("フォルダ", _basename(h), h,
+                                _basename(h).lower(), -1, 0, i)
+                               for i, h in enumerate(hits)]
+                    p.dtotal = total
+                    self.display(pane=p)
+                elif k == "finddone":
+                    _, g, total, hits, secs = msg
+                    if g == self._find_gen:
+                        self.fill_find(total, hits, secs)
                 elif k == "scanprog":
                     self.status.set("スキャン中... %dフォルダ発見" % msg[1])
                 elif k == "scandone":
@@ -2981,19 +3446,27 @@ class App:
                     self.status.set("インデックス更新完了: %dフォルダ" % msg[1])
                     self.update_scan_label()
                     self.build_side()
+                    self.after_index_change()
                 elif k == "scanstop":
                     self.scanning = False
                     self.status.set("スキャン停止（インデックスは未更新）")
                 elif k == "idxdone":
                     self.idx_state = "ready"
                     self.status.set("インデックス読込完了: %dフォルダ" % msg[1])
-                    if self._pending_fsearch:
-                        self._pending_fsearch = False
-                        if self.cur_tab() == 1:
-                            self.fsearch_folder()
+                    pend = self._pending_fsearch
+                    self._pending_fsearch = False
+                    if pend and self.cur_tab() == TAB_EXP:
+                        self.show_dsearch(*pend)
+                    self.after_index_change()
         except queue.Empty:
             pass
-        self.root.after(150, self.poll_fq)
+        self.root.after(10 if busy else 100, self.poll_fq)
+
+    def after_index_change(self):
+        """インデックスの読込/更新後: フォルダ検索タブの表示を最新にする"""
+        self.update_find_info()
+        if parse_query(self.var_find.get()):
+            self.run_find()
 
     def full_scan(self):
         if self.scanning:
@@ -3015,8 +3488,7 @@ class App:
                 self.fq.put(("scanstop",))
                 return
             save_dirindex(paths)
-            self.index.paths = paths
-            self.index.rebuild()
+            self.index.set_paths(paths)
             self.fq.put(("scandone", len(paths)))
 
         threading.Thread(target=run, daemon=True).start()
@@ -3044,8 +3516,7 @@ class App:
                     and not p.lower().startswith(low + os.sep)]
             allp = kept + add
             save_dirindex(allp)
-            self.index.paths = allp
-            self.index.rebuild()
+            self.index.set_paths(allp)
             self.fq.put(("scandone", len(allp)))
 
         threading.Thread(target=run, daemon=True).start()
@@ -3299,6 +3770,18 @@ class App:
             self.open_file_path(path)
         return "break"
 
+    def on_ftree_dblclick(self, event):
+        """ダブルクリック: 行の上なら開く。列見出しの境界なら列幅を内容に
+        合わせる(Explorer同様)。見出し上のダブルクリックでは何も開かない"""
+        t = event.widget
+        region = t.identify_region(event.x, event.y)
+        if region == "separator":
+            autofit_column(t, t.identify_column(event.x), self.cur_font)
+            return "break"
+        if region not in ("tree", "cell"):
+            return "break"
+        return self.on_ftree_enter()
+
     def on_ftree_place(self, event=None):
         iid = self.ftree.focus()
         path = self.fpaths.get(iid)
@@ -3399,6 +3882,425 @@ class App:
         self.root.clipboard_append(text)
         self.status.set("コピーしました: " + text)
 
+    # ---------- フォルダ検索タブ(Everything風) ----------
+    def build_find_tab(self, conf):
+        """入力するそばからインデックス全体のフォルダ名を検索するタブ。
+        戻り値は区切り線(テーマ色の対象)"""
+        tab = self.tabd
+        top = ttk.Frame(tab, padding=(10, 8, 10, 4))
+        top.pack(fill="x")
+        ttk.Label(top, text="フォルダ名:").pack(side="left")
+        self.var_find = tk.StringVar()
+        self.ent_find = ttk.Entry(top, textvariable=self.var_find)
+        self.ent_find.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        Tip(self.ent_find, "入力するそばから全フォルダを検索 (Ctrl+F)\n"
+                           "スペース=AND  -語=除外  *?=ワイルドカード\n"
+                           "\\ や / を含む語はパス全体で照合  "
+                           "↓で結果へ  Escで消去")
+        self.var_find.trace_add("write", lambda *a: self.schedule_find())
+        self.ent_find.bind("<Return>", self.on_find_enter)
+        self.ent_find.bind("<Down>", self.on_find_down)
+        self.ent_find.bind("<Escape>", self.on_find_escape)
+        self.var_fpath = tk.BooleanVar(value=conf.get("fpath", "0") == "1")
+        chk = ttk.Checkbutton(top, text="パス全体も対象",
+                              variable=self.var_fpath,
+                              command=self.on_fpath_toggle)
+        chk.pack(side="left", padx=(10, 0))
+        Tip(chk, "ON: パスのどこかに含まれれば一致\n"
+                 "OFF: フォルダ名そのものに含まれる場合だけ一致")
+        b = ttk.Button(top, text="インデックス更新", takefocus=False,
+                       command=self.full_scan)
+        b.pack(side="left", padx=(10, 0))
+        Tip(b, "設定タブの検索ルートを再スキャン (Ctrl+Shift+I)")
+
+        self.var_find_info = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.var_find_info, style="Sub.TLabel",
+                  padding=(12, 0, 10, 4)).pack(fill="x")
+        gold = tk.Frame(tab, height=1)
+        gold.pack(fill="x", padx=10)
+
+        mid = ttk.Frame(tab)
+        mid.pack(fill="both", expand=True, padx=10, pady=(6, 8))
+        t = ttk.Treeview(mid, columns=("place",), show="tree headings")
+        self.dtree = t
+        t.heading("#0", command=lambda: self.find_sort_by("name"))
+        t.heading("place", command=lambda: self.find_sort_by("path"))
+        # 名前列は stretch=False(手で決めた幅を保つ)。余白は場所列で吸収
+        t.column("#0", width=300, minwidth=60, stretch=False)
+        t.column("place", width=620, minwidth=150, stretch=True)
+        self.update_find_headings()
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=t.yview)
+        hsb = ttk.Scrollbar(mid, orient="horizontal", command=t.xview)
+        t.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        t.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="we")
+        mid.rowconfigure(0, weight=1)
+        mid.columnconfigure(0, weight=1)
+        t.bind("<Double-1>", self.on_find_dblclick)
+        t.bind("<Return>", lambda e: self.find_open("app"))
+        t.bind("<Shift-Return>", lambda e: self.find_open("newtab"))
+        t.bind("<Control-Return>", lambda e: self.find_open("explorer"))
+        t.bind("<Alt-Return>", lambda e: self.find_open("props"))
+        t.bind("<Button-3>", self.on_find_rclick)
+        t.bind("<App>", self.on_find_menu_key)
+        t.bind("<Shift-F10>", self.on_find_menu_key)
+        t.bind("<Escape>", lambda e: (self.focus_find_entry(), "break")[1])
+        t.bind("<Control-c>", lambda e: (self.find_copy(), "break")[1])
+        t.bind("<BackSpace>", self.on_find_backspace)
+        t.bind("<KeyPress>", self.on_find_tree_key)
+
+        m = tk.Menu(self.root, tearoff=0)
+        self.dmenu = m
+        m.add_command(label="エクスプローラタブで開く (Enter)",
+                      command=lambda: self.fd_do("app"))
+        m.add_command(label="新しいタブで開く (Shift+Enter)",
+                      command=lambda: self.fd_do("newtab"))
+        m.add_command(label="親フォルダを開いてこのフォルダを選択",
+                      command=lambda: self.fd_do("parent"))
+        m.add_command(label="Explorerで開く (Ctrl+Enter)",
+                      command=lambda: self.fd_do("explorer"))
+        m.add_separator()
+        m.add_command(label="この場所で文書内検索 (Ctrl+G)",
+                      command=lambda: self.fd_do("todoc"))
+        m.add_command(label="お気に入りに追加 (F8)",
+                      command=lambda: self.fd_do("fav"))
+        self.dmenu_term = tk.Menu(m, tearoff=0)
+        self.dmenu_term.add_command(
+            label="コマンドプロンプト (Ctrl+Shift+C)",
+            command=lambda: self.fd_do("term_cmd"))
+        self.dmenu_term.add_command(
+            label="PowerShell (Ctrl+Shift+S)",
+            command=lambda: self.fd_do("term_powershell"))
+        self.dmenu_term.add_command(
+            label="Windows Terminal", command=lambda: self.fd_do("term_wt"))
+        m.add_cascade(label="この場所で端末を開く", menu=self.dmenu_term)
+        m.add_command(label="プロパティ (Alt+Enter)",
+                      command=lambda: self.fd_do("props"))
+        m.add_separator()
+        m.add_command(label="フルパスをコピー (Ctrl+C)",
+                      command=lambda: self.fd_do("cp_full"))
+        m.add_command(label="名前をコピー",
+                      command=lambda: self.fd_do("cp_name"))
+        m.add_separator()
+        m.add_command(label="このフォルダ以下を再スキャン",
+                      command=lambda: self.fd_do("rescan"))
+        return gold
+
+    def find_state(self):
+        return (self.var_find.get(), bool(self.var_fpath.get()),
+                self.find_sort)
+
+    def update_find_info(self, text=None):
+        """フォルダ検索タブの案内行(件数やインデックスの状態)を更新"""
+        if text is None:
+            if not parse_query(self.var_find.get()):
+                text = self.find_idle_text()
+            else:
+                return
+        self.var_find_info.set(text)
+
+    def find_idle_text(self):
+        if self.idx_state == "ready":
+            try:
+                when = fmt_time(os.path.getmtime(DIRIDX_FILE))
+            except OSError:
+                when = "未保存"
+            return ("全 %s フォルダから検索します（最終スキャン: %s）。"
+                    "スペース=AND  -語=除外  *?=ワイルドカード"
+                    % (format(len(self.index.paths), ","), when))
+        if self.idx_state == "loading":
+            return "インデックス読込中..."
+        if not os.path.exists(DIRIDX_FILE):
+            return ("インデックス未作成: 設定タブの「検索ルート」に対象"
+                    "（例: C:\\ や \\\\server\\share）を記入し、"
+                    "「インデックス更新」(Ctrl+Shift+I) を押してください")
+        return "インデックス未読込（このタブを開くと読み込みます）"
+
+    def schedule_find(self, delay=FIND_DELAY_MS):
+        """入力のたびに呼ばれる。打ち終わるのを少し待ってから検索する"""
+        if self._find_job:
+            self.root.after_cancel(self._find_job)
+        self._find_job = self.root.after(delay, self.run_find)
+
+    def run_find(self):
+        if self._find_job:
+            self.root.after_cancel(self._find_job)
+            self._find_job = None
+        self._find_stop.set()           # 前の検索が走っていれば打ち切る
+        self._find_gen += 1
+        gen = self._find_gen
+        state = self.find_state()
+        query, full, (sort, desc) = state
+        if not parse_query(query):
+            self._find_focus_after = False
+            self.fill_find(0, [], None)
+            return
+        if self.idx_state != "ready":
+            self.ensure_index()
+            self.update_find_info(self.find_idle_text())
+            return
+        stop = threading.Event()
+        self._find_stop = stop
+        self._find_running = state
+        index = self.index
+        t0 = time.time()
+
+        def work():
+            res = index.search(query, MAX_ROWS, full_path=full, sort=sort,
+                               desc=desc, stop=stop)
+            if res is not None:
+                self.fq.put(("finddone", gen, res[0], res[1],
+                             time.time() - t0))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def fill_find(self, total, hits, secs):
+        t = self.dtree
+        keep = self.find_paths.get(t.focus())
+        kids = t.get_children()
+        if kids:
+            t.delete(*kids)
+        self.find_paths = {}
+        ico = self.icons["folder"]
+        sel = None
+        for i, p in enumerate(hits):
+            iid = t.insert("", "end", text=_basename(p), image=ico,
+                           values=(parent_of(p),),
+                           tags=("folder", "odd" if i % 2 else "even"))
+            self.find_paths[iid] = p
+            if p == keep:
+                sel = iid
+        kids = t.get_children()
+        if kids:
+            cur = sel or kids[0]
+            t.selection_set(cur)
+            t.focus(cur)
+            t.see(cur)
+        if secs is None:
+            self._find_shown = None
+            self.update_find_info()
+            return
+        self._find_shown = self._find_running
+        sort, desc = self.find_sort
+        order = {"rank": "関連度順", "name": "名前順",
+                 "path": "場所順"}[sort] + (" (降順)" if desc else "")
+        txt = "%s 件（%.2f秒・%s）" % (format(total, ","), secs, order)
+        if total > len(hits):
+            txt += "  上位 %s 件を表示中。語を足すと絞り込めます" % format(
+                len(hits), ",")
+        elif not total:
+            txt = "該当なし（%.2f秒）。インデックスが古い場合は「インデックス更新」" \
+                  % secs
+        self.update_find_info(txt)
+        if self.cur_tab() == TAB_FIND:
+            self.status.set("フォルダ検索: " + txt)
+        if self._find_focus_after:
+            self._find_focus_after = False
+            self.focus_find_list()
+
+    def update_find_headings(self):
+        sort, desc = self.find_sort
+        for col, key, base in (("#0", "name", "名前"),
+                               ("place", "path", "場所")):
+            mark = (" ▼" if desc else " ▲") if sort == key else ""
+            self.dtree.heading(col, text=base + mark)
+
+    def find_sort_by(self, key):
+        """列見出しクリック: 昇順 → 降順 → 関連度順 の順に切り替え"""
+        sort, desc = self.find_sort
+        if sort != key:
+            self.find_sort = (key, False)
+        elif not desc:
+            self.find_sort = (key, True)
+        else:
+            self.find_sort = ("rank", False)
+        self.update_find_headings()
+        self.run_find()
+
+    def on_fpath_toggle(self):
+        self.save_conf()
+        self.run_find()
+
+    def focus_find_entry(self):
+        self.nb.select(self.tabd)
+        self.ent_find.focus_set()
+        self.ent_find.select_range(0, "end")
+        self.ent_find.icursor("end")
+
+    def focus_find_list(self):
+        self.nb.select(self.tabd)
+        t = self.dtree
+        kids = t.get_children()
+        if not kids:
+            self.focus_find_entry()
+            return
+        cur = t.focus() or kids[0]
+        t.selection_set(cur)
+        t.focus(cur)
+        t.see(cur)
+        t.focus_set()
+
+    def focus_find_default(self):
+        """タブを開いた時: 一覧か検索欄にフォーカスがなければ検索欄へ"""
+        try:
+            cur = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            cur = None
+        if self.cur_tab() == TAB_FIND and cur not in (self.dtree,
+                                                      self.ent_find):
+            self.focus_find_entry()
+
+    def on_find_enter(self, event=None):
+        """検索欄でEnter: 結果が出ていれば一覧へ(出る前なら出た時に)"""
+        if self._find_job is None and self._find_shown == self.find_state():
+            self.focus_find_list()
+        else:
+            self._find_focus_after = True
+            self.run_find()
+        return "break"
+
+    def on_find_down(self, event=None):
+        if self.dtree.get_children():
+            self.focus_find_list()
+        return "break"
+
+    def on_find_escape(self, event=None):
+        if self.var_find.get():
+            self.var_find.set("")
+        return "break"
+
+    def on_find_tree_key(self, event):
+        """一覧上で文字を打ったら検索欄へ送る(Everything同様)"""
+        ch = event.char
+        if not ch or len(ch) != 1 or not ch.isprintable():
+            return None
+        if event.state & 0x4 or event.state & 0x20000:   # Ctrl / Alt
+            return None
+        self.ent_find.focus_set()
+        self.ent_find.select_clear()
+        self.ent_find.insert("end", ch)
+        self.ent_find.icursor("end")
+        return "break"
+
+    def on_find_backspace(self, event=None):
+        s = self.var_find.get()
+        if s:
+            self.var_find.set(s[:-1])
+        self.ent_find.focus_set()
+        self.ent_find.icursor("end")
+        return "break"
+
+    def find_focus_path(self):
+        return self.find_paths.get(self.dtree.focus())
+
+    def find_copy(self):
+        paths = [self.find_paths[i] for i in self.dtree.selection()
+                 if i in self.find_paths]
+        if paths:
+            self.to_clip("\n".join(paths))
+
+    def on_find_dblclick(self, event):
+        t = self.dtree
+        region = t.identify_region(event.x, event.y)
+        if region == "separator":
+            autofit_column(t, t.identify_column(event.x), self.cur_font)
+        elif region in ("tree", "cell"):
+            self.find_open("app")
+        return "break"
+
+    def on_find_rclick(self, event):
+        t = self.dtree
+        iid = t.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in t.selection():
+            t.selection_set(iid)
+        t.focus(iid)
+        self.dmenu_iid = iid
+        try:
+            self.dmenu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.dmenu.grab_release()
+
+    def on_find_menu_key(self, event=None):
+        t = self.dtree
+        iid = t.focus()
+        if not iid:
+            return "break"
+        self.dmenu_iid = iid
+        bbox = t.bbox(iid)
+        if bbox:
+            x = t.winfo_rootx() + bbox[0] + 60
+            y = t.winfo_rooty() + bbox[1] + bbox[3]
+        else:
+            x = t.winfo_rootx() + 60
+            y = t.winfo_rooty() + 20
+        try:
+            self.dmenu.tk_popup(x, y)
+        finally:
+            self.dmenu.grab_release()
+        return "break"
+
+    def find_open(self, how):
+        self.dmenu_iid = self.dtree.focus()
+        self.fd_do(how)
+        return "break"
+
+    def fd_do(self, act):
+        """フォルダ検索の結果行に対する操作"""
+        path = self.find_paths.get(self.dmenu_iid)
+        if not path:
+            return
+        if act in ("app", "newtab", "parent", "explorer", "todoc", "fav",
+                   "props") or act.startswith("term_"):
+            if not os.path.isdir(path):
+                self.status.set("フォルダが存在しません: " + path +
+                                "（インデックスが古い可能性。右クリック→"
+                                "親フォルダで再スキャン、またはインデックス更新）")
+                return
+        if act == "app":
+            self.open_dir_in_app(path)
+        elif act == "newtab":
+            self.open_dir_in_app(path, newtab=True)
+        elif act == "parent":
+            parent = parent_of(path)
+            if parent:
+                self.open_dir_in_app(parent, select=path)
+        elif act == "explorer":
+            self.open_folder_plain(path)
+        elif act == "todoc":
+            self.var_dir.set(path)
+            self.nb.select(self.tab1)
+            self.focus_widget(self.ent_word)
+            self.status.set("文書内検索のフォルダに設定しました")
+        elif act == "fav":
+            self._add_fav(path)
+        elif act.startswith("term_"):
+            self.open_terminal_here(act[5:], path)
+        elif act == "props":
+            self.show_properties(path)
+        elif act == "cp_full":
+            if len(self.dtree.selection()) > 1:
+                self.find_copy()
+            else:
+                self.to_clip(path)
+        elif act == "cp_name":
+            self.to_clip(_basename(path))
+        elif act == "rescan":
+            self.rescan_subtree(path)
+
+    def open_dir_in_app(self, path, newtab=False, select=None):
+        """フォルダをこのアプリのエクスプローラタブで開く"""
+        self.nb.select(self.tabf)
+        self.focus_list = True
+        if newtab:
+            self.new_tab(path)
+        else:
+            if select:
+                self.sel_target = select
+            self.navigate(path)
+
     # ---------- エディタ/端末/シェル連携 ----------
     def sel_paths(self):
         """アクティブなペインで選択中の行のパス一覧"""
@@ -3435,11 +4337,12 @@ class App:
 
     def editor_key(self):
         """Ctrl+Shift+E: 表示中のタブに応じて対象ファイルを決める"""
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             paths = self.sel_paths()
             if not paths:
                 paths = [self.fpaths.get(self.ftree.focus(), "")]
-        elif self.cur_tab() == 0:
+        elif tab == TAB_DOC:
             paths = [self.paths.get(self.tree.focus(), "")]
         else:
             return
@@ -3482,10 +4385,13 @@ class App:
 
     def terminal_key(self, kind):
         """Ctrl+Shift+C / S: 表示中のタブに応じた場所で端末を開く"""
-        if self.cur_tab() == 1:
+        tab = self.cur_tab()
+        if tab == TAB_EXP:
             self.open_terminal_here(kind)
-        elif self.cur_tab() == 0:
+        elif tab == TAB_DOC:
             self.open_terminal_here(kind, self.doc_dir_of(self.tree.focus()))
+        elif tab == TAB_FIND:
+            self.open_terminal_here(kind, self.find_focus_path())
 
     def show_properties(self, path=None):
         if path is None:
@@ -3497,7 +4403,7 @@ class App:
             self.status.set("プロパティを表示できません: " + path)
 
     def new_text_file(self):
-        if self.cur_tab() != 1:
+        if self.cur_tab() != TAB_EXP:
             return
         p = self.panes[self.cur_pane]
         if not p.scope_dir:
@@ -3661,6 +4567,8 @@ class App:
         return conf
 
     def save_conf(self):
+        # 最大化中は通常時の位置/サイズを残す(書き込みで空にする前に読む)
+        old_geom = self.load_conf().get("geom", "")
         try:
             with open(CONF_FILE, "w", encoding="utf-8") as f:
                 f.write("theme=" + self.var_theme.get() + "\n")
@@ -3670,6 +4578,12 @@ class App:
                 f.write("editor=" + self.var_editor.get().strip() + "\n")
                 f.write("dpath=" + ("1" if self.var_dpath.get() else "0")
                         + "\n")
+                f.write("fpath=" + ("1" if self.var_fpath.get() else "0")
+                        + "\n")
+                f.write("fold=" + ("1" if self.var_fold.get() else "0")
+                        + "\n")
+                for key, tr in getattr(self, "col_trees", {}).items():
+                    f.write(key + "=" + col_widths(tr) + "\n")
                 try:
                     zoomed = self.root.state() == "zoomed"
                 except tk.TclError:
@@ -3678,8 +4592,7 @@ class App:
                 if not zoomed:
                     f.write("geom=" + self.root.winfo_geometry() + "\n")
                 else:
-                    f.write("geom=" + self.load_conf().get("geom", "")
-                            + "\n")
+                    f.write("geom=" + old_geom + "\n")
         except OSError:
             pass
 
@@ -3820,7 +4733,7 @@ class App:
                           highlightthickness=1 if p["dark"] else 0,
                           highlightbackground=p["gold"],
                           highlightcolor=p["accent"])
-        for mn in (self.menu, self.fmenu, self.fmenu_term, self.tmenu):
+        for mn in self.all_menus():
             mn.configure(bg=p["panel"], fg=p["fg"],
                          activebackground=p["sel"],
                          activeforeground=p["selfg"])
@@ -3837,7 +4750,8 @@ class App:
                                         ("active", p["panel"])])
         for line in self.gold_lines:
             line.configure(bg=p["gold"])
-        for tr in (self.tree, self.panes[0].tree, self.panes[1].tree):
+        for tr in (self.tree, self.panes[0].tree, self.panes[1].tree,
+                   self.dtree):
             tr.tag_configure("even", background=p["field"])
             tr.tag_configure("odd", background=p["alt"])
             tr.tag_configure("err", foreground=p["gold"] if p["dark"]
@@ -3847,6 +4761,10 @@ class App:
         self.side.tag_configure("grp", foreground=p["sub"])
         self.side.tag_configure("itm", foreground=p["fg"])
         dark_title_bar(self.root, p["dark"])
+
+    def all_menus(self):
+        return (self.menu, self.fmenu, self.fmenu_term, self.tmenu,
+                self.dmenu, self.dmenu_term)
 
     def apply_font(self):
         fam = self.var_font.get()
@@ -3881,7 +4799,7 @@ class App:
             sp.configure(font=f)
         for txt in self.texts:
             txt.configure(font=f)
-        for mn in (self.menu, self.fmenu, self.fmenu_term, self.tmenu):
+        for mn in self.all_menus():
             mn.configure(font=f)
         st.configure("TCheckbutton", font=f)
         self.side.tag_configure("hdr", font=(fam, max(8, size - 1), "bold"))
@@ -3968,7 +4886,14 @@ class App:
         self.status.set("お気に入りに追加: " + name)
 
     def add_favorite(self):
-        if self.cur_tab() == 1:
+        if self.cur_tab() == TAB_FIND:
+            path = self.find_focus_path()
+            if path:
+                self._add_fav(path)
+            else:
+                self.status.set("お気に入りに追加する行を選んでください")
+            return
+        if self.cur_tab() == TAB_EXP:
             path = None
             try:
                 cur = self.root.focus_get()
@@ -4099,12 +5024,17 @@ class App:
         dlg.transient(self.root)
         dlg.geometry("+%d+%d" % (self.root.winfo_rootx() + 200,
                                  self.root.winfo_rooty() + 20))
-        txt = tk.Text(dlg, width=62, height=38, bg=self.pal["field"],
+        frm = tk.Frame(dlg, bg=self.pal["bg"])
+        frm.pack(fill="both", expand=True, padx=8, pady=8)
+        txt = tk.Text(frm, width=66, height=40, bg=self.pal["field"],
                       fg=self.pal["fg"], relief="flat",
                       font=self.cur_font, padx=12, pady=10)
+        sb = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
         txt.insert("1.0", HELP_TEXT)
         txt.configure(state="disabled")
-        txt.pack(padx=8, pady=8)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.bind("<Return>", lambda e: dlg.destroy())
         dlg.bind("<F1>", lambda e: dlg.destroy())
@@ -4177,23 +5107,58 @@ class App:
         excludes = [s.strip().lower()
                     for s in self.var_ex.get().split(",") if s.strip()]
         exts = self.get_exts()
-        for i in self.tree.get_children():
-            self.tree.delete(i)
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.delete(*kids)
         self.paths = {}
         self.hit_count = 0
         self.row_i = 0
         self.running = True
-        self.btn.config(state="disabled")
-        self.status.set("検索中...")
+        # 検索ごとに専用のキューと停止フラグを使う(停止直後に次の検索を
+        # 始めても、前の検索の結果が混ざらないように)
+        self.q = queue.Queue()
+        self.doc_stop = threading.Event()
+        self.btn.config(text="停止(Esc)")
+        self.status.set("検索中...（Escで停止）")
         threading.Thread(target=search_worker,
-                         args=(folder, word, ctx, excludes, exts, self.q),
+                         args=(folder, word, ctx, excludes, exts, self.q,
+                               self.doc_stop, bool(self.var_fold.get())),
                          daemon=True).start()
-        self.root.after(100, self.poll)
+        self.root.after(100, self.poll, self.q)
 
-    def poll(self):
+    def toggle_doc_search(self):
+        """検索ボタン: 検索中なら停止、そうでなければ検索開始"""
+        if self.running:
+            self.stop_doc_search()
+        else:
+            self.start()
+
+    def stop_doc_search(self):
+        if not self.running:
+            return
+        self.doc_stop.set()
+        self.running = False
+        self.btn.config(text="検索(F5)")
+        self.status.set("検索を停止しました: ヒット %d 件（途中まで）"
+                        % self.hit_count)
+
+    def on_doc_escape(self, event=None):
+        if self.running:
+            self.stop_doc_search()
+            return "break"
+        return None
+
+    def poll(self, q):
+        if q is not self.q or not self.running:
+            return                  # 停止済み/次の検索が始まった古い検索
+        deadline = time.time() + 0.08
+        wait = 100
         try:
             while True:
-                item = self.q.get_nowait()
+                if time.time() > deadline:
+                    wait = 10       # まだ溜まっているのですぐ続きを処理
+                    break
+                item = q.get_nowait()
                 if item[0] in ("hit", "err"):
                     _, path, name, folder, label, frag = item
                     if item[0] == "err":
@@ -4208,20 +5173,24 @@ class App:
                     self.paths[iid] = path
                     if item[0] == "hit":
                         self.hit_count += 1
-                        self.status.set("検索中... ヒット %d 件" % self.hit_count)
+                        self.status.set("検索中... ヒット %d 件（Escで停止）"
+                                        % self.hit_count)
                 else:
                     _, nf, nh, ne = item
+                    if not self.running:
+                        return      # 停止ボタンで打ち切り済み
                     self.status.set(
                         "完了: 対象 %d ファイル / ヒット %d 件 / エラー %d 件"
                         % (nf, nh, ne))
                     self.running = False
-                    self.btn.config(state="normal")
+                    self.btn.config(text="検索(F5)")
                     if nh > 0:
                         self.focus_tree()
+                    return
         except queue.Empty:
             pass
         if self.running:
-            self.root.after(100, self.poll)
+            self.root.after(wait, self.poll, q)
 
     def export_csv(self):
         rows = self.tree.get_children()
@@ -4248,12 +5217,17 @@ class App:
     def open_folder_of(self, iid):
         self.open_folder_sel(self.paths.get(iid))
 
-    def on_click(self, event):
-        if self.tree.identify("region", event.x, event.y) != "tree":
-            return
-        if self.tree.identify_column(event.x) != "#0":
-            return
-        self.open_file_of(self.tree.identify_row(event.y))
+    def on_dblclick(self, event):
+        """ダブルクリックでファイルを開く(以前は1クリックで開いてしまい、
+        行を選ぶだけのつもりでもファイルが起動していた)。
+        列見出しの境界なら列幅を内容に合わせる"""
+        region = self.tree.identify_region(event.x, event.y)
+        if region == "separator":
+            autofit_column(self.tree, self.tree.identify_column(event.x),
+                           self.cur_font)
+        elif region in ("tree", "cell"):
+            self.open_file_of(self.tree.identify_row(event.y))
+        return "break"
 
     def on_tree_folder(self, event):
         self.open_folder_of(self.tree.focus())
