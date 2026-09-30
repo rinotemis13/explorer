@@ -18,7 +18,7 @@
 #   Ctrl+Shift+D: 2ペイン表示切替  Tab(一覧上): 反対のペインへ
 #   Ctrl+X / Ctrl+C / Ctrl+V / Delete (一覧上): 切取/コピー/貼付/ごみ箱
 #   F2(一覧上): 名前の変更   Ctrl+Shift+N: 新しいフォルダー
-#   Ctrl+A(一覧上): すべて選択
+#   Ctrl+A(一覧上): すべて選択   Ctrl+H: ~$一時ファイルの表示/非表示
 #   Explorer・デスクトップからのドラッグ&ドロップ受け入れ(コピー)
 #   一覧で Enter  : フォルダに入る / ファイルを開く
 #   Ctrl+Enter    : Explorerで場所を開く
@@ -192,6 +192,7 @@ HELP_TEXT = """【全体】
   Delete             ごみ箱へ削除
   F2 (一覧上)        名前の変更
   Ctrl+Shift+N       新しいフォルダー
+  Ctrl+H             ~$で始まる一時ファイル(Excel等の編集中)の表示/非表示
   Ctrl+A (一覧上)    すべて選択(Shift/Ctrl+クリックで個別複数選択)
   ※ Explorerやデスクトップからのドラッグ&ドロップでコピーできます
   一覧: Enter=開く  Ctrl+Enter=Explorerで場所を開く
@@ -1308,6 +1309,13 @@ class DirIndex:
         return total, [s.paths[li] for li in top]
 
 
+def is_office_temp(name):
+    """Excel/Word等の編集中にできる一時ファイルか
+    (~$見積書.xlsx などの所有者ファイル、~WRL0001.tmp などの作業ファイル)"""
+    return name.startswith("~$") or (
+        name.startswith("~") and name.lower().endswith(".tmp"))
+
+
 def list_under(folder, depth, stop, out_q, pidx, gen):
     count = [0]
 
@@ -1928,6 +1936,14 @@ class App:
                           takefocus=False, command=self.fsearch)
         b_fs.pack(side="left", padx=(6, 0))
         Tip(b_fs, "カーソルのある欄(フォルダ名/ファイル名)で検索")
+        self.var_showtmp = tk.BooleanVar(
+            value=conf.get("showtmp", "0") == "1")
+        chk_tmp = ttk.Checkbutton(ftop, text="~$表示", takefocus=False,
+                                  variable=self.var_showtmp,
+                                  command=self.on_showtmp_toggle)
+        chk_tmp.pack(side="left", padx=(8, 0))
+        Tip(chk_tmp, "Excel/Word等の編集中にできる一時ファイル\n"
+                     "(~$で始まるファイル等)を表示する (Ctrl+H)")
 
         gold3 = tk.Frame(self.tabf, height=1)
         gold3.pack(fill="x", padx=10)
@@ -2209,6 +2225,7 @@ class App:
         root.bind("<Control-o>", lambda e: self.focus_side_key())
         root.bind("<Control-k>", lambda e: self.focus_list_key())
         root.bind("<Control-Shift-D>", lambda e: self.toggle_two_pane())
+        root.bind("<Control-h>", lambda e: self.toggle_showtmp_key())
         root.bind("<Control-Shift-E>", lambda e: self.editor_key())
         root.bind("<Control-Shift-C>", lambda e: self.terminal_key("cmd"))
         root.bind("<Control-Shift-S>",
@@ -3231,6 +3248,29 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def on_showtmp_toggle(self):
+        """~$一時ファイルの表示切替: 読み直さずに表示中の一覧を出し直す"""
+        self.save_conf()
+        for i, p in enumerate(self.panes):
+            if i == self.cur_pane or self.two_pane:
+                self.display(pane=p)
+        self.status.set("一時ファイル(~$...)を"
+                        + ("表示します" if self.var_showtmp.get()
+                           else "非表示にします") + "（Ctrl+Hで切替）")
+
+    def toggle_showtmp_key(self):
+        if self.cur_tab() != TAB_EXP:
+            return None
+        try:
+            cur = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            cur = None
+        if isinstance(cur, (tk.Entry, tk.Spinbox)):
+            return None     # 入力欄では Ctrl+H は1文字削除(Tk標準)のまま
+        self.var_showtmp.set(not self.var_showtmp.get())
+        self.on_showtmp_toggle()
+        return "break"
+
     def on_dpath_toggle(self):
         """「パス」の切替: 検索結果を表示中なら新しい条件で出し直す"""
         self.save_conf()
@@ -3266,6 +3306,12 @@ class App:
         cur_path = p.fpaths.get(p.tree.focus())
         toks = parse_query(p.word)
         rows = p.scope
+        hidden = 0
+        if not self.var_showtmp.get():
+            n = len(rows)
+            rows = [r for r in rows
+                    if not (r[0] == "ファイル" and is_office_temp(r[1]))]
+            hidden = n - len(rows)
         if toks:
             # Explorer同様、フォルダ名も対象に含める(r[3]=小文字の名前)
             rows = [r for r in rows if match_query(r[3], toks)]
@@ -3284,6 +3330,8 @@ class App:
                     len(rows), p.depth)
             else:
                 note = "%d 件" % len(rows)
+            if hidden:
+                note += "（~$一時ファイル %d 件は非表示・Ctrl+Hで表示）" % hidden
         self.fill_ftree(p, rows, note if active else "")
         self.update_headings(p)
         kids = p.tree.get_children()
@@ -4579,6 +4627,8 @@ class App:
                 f.write("dpath=" + ("1" if self.var_dpath.get() else "0")
                         + "\n")
                 f.write("fpath=" + ("1" if self.var_fpath.get() else "0")
+                        + "\n")
+                f.write("showtmp=" + ("1" if self.var_showtmp.get() else "0")
                         + "\n")
                 f.write("fold=" + ("1" if self.var_fold.get() else "0")
                         + "\n")
