@@ -32,8 +32,9 @@
 #   Alt+Enter: プロパティ  Shift+Delete: 完全削除  一覧で文字入力: 頭文字ジャンプ
 #   アドレスバーに cmd / powershell / wt と入力+Enter でもその場所で端末を開く
 # ---- フォルダ検索タブ(Everything風) ----
-#   入力するそばからインデックス全体のフォルダ名を検索して一覧表示
-#   Enter/ダブルクリック: エクスプローラタブで開く  Ctrl+Enter: Explorerで開く
+#   入力するそばからインデックス全体のフォルダ名/ファイル名を検索して一覧表示
+#   Enter/ダブルクリック: フォルダはエクスプローラタブで、ファイルはそのまま開く
+#   Ctrl+Enter: Explorerで開く  Ctrl+Shift+F: 対象(フォルダ/ファイル/両方)切替
 # ---- 検索語の書き方(フォルダ名/ファイル名検索共通) ----
 #   スペース区切りで AND、-語 で除外、* ? を含む語はワイルドカード一致
 #   フォルダ名検索は既定で「フォルダ名そのもの」に一致(パス全体は「パス」にチェック)
@@ -64,6 +65,8 @@ MAX_ROWS = 2000
 MAX_LIST = 200000
 SCAN_WORKERS = 8
 FIND_DELAY_MS = 150      # フォルダ検索タブ: 入力が止まってから検索するまでの待ち
+# フォルダ検索タブの「対象」
+FIND_MODES = {"dir": "フォルダ", "file": "ファイル", "both": "両方"}
 # 上位タブの並び順(Alt+1〜4 もこの順)
 TAB_DOC, TAB_EXP, TAB_FIND, TAB_CONF = range(4)
 # インデックス作成時に潜らないシステムフォルダ(小文字)
@@ -82,6 +85,7 @@ CONF_FILE = os.path.join(BASE_DIR, "doc_search_conf.txt")
 FAV_FILE = os.path.join(BASE_DIR, "doc_search_fav.txt")
 ROOTS_FILE = os.path.join(BASE_DIR, "doc_search_roots.txt")
 DIRIDX_FILE = os.path.join(BASE_DIR, "doc_search_dirindex.txt")
+FILEIDX_FILE = os.path.join(BASE_DIR, "doc_search_fileindex.txt")
 TABS_FILE = os.path.join(BASE_DIR, "doc_search_tabs.txt")
 
 WIN_STD = "Windows標準"
@@ -158,10 +162,13 @@ HELP_TEXT = """【全体】
   ※ 大文字小文字は区別しません。「全角/半角を区別しない」で ＡＢＣ と ABC、
      ｱｲｳ と アイウ も同じとみなします。Excelは数値セルも検索対象です
 
-【フォルダ検索】(Everything風: 入力するそばから全フォルダを検索)
+【フォルダ検索】(Everything風: 入力するそばから全フォルダ/ファイルを検索)
+  対象               フォルダ / ファイル / 両方 (Ctrl+Shift+F で切替)
+                     ファイルは設定タブ「ファイル名もインデックスに含める」が必要
   Ctrl+F / F3        検索欄へ     ↓ (検索欄)  結果一覧へ    Esc  検索欄を空に
-  Enter / ダブルクリック  エクスプローラタブでそのフォルダを開く
-  Shift+Enter        新しいタブで開く    Ctrl+Enter  Explorerで開く
+  Enter / ダブルクリック  フォルダ: エクスプローラタブで開く
+                         ファイル: そのファイルを開く
+  Shift+Enter        新しいタブで開く    Ctrl+Enter  Explorerで開く(選択)
   Ctrl+C             フルパスをコピー    Ctrl+R      再検索
   列見出しクリック   名前/場所で並べ替え(3回目で関連度順に戻る)
   ※ 対象は設定タブの「検索ルート」から作ったインデックス(Ctrl+Shift+I で更新)
@@ -1051,7 +1058,9 @@ def _is_junction(e):
     return tag == 0xA0000003
 
 
-def scan_dirs(roots, stop, progress):
+def scan_dirs(roots, stop, progress, files=None):
+    """roots 以下のフォルダを全部列挙して返す。files にリストを渡すと
+    ファイルのパスもそこへ集める(Excel等の ~$ 一時ファイルは除く)"""
     result = []
     work = queue.Queue()
     lock = threading.Lock()
@@ -1085,21 +1094,27 @@ def scan_dirs(roots, stop, progress):
                 continue
             found = []
             subs = []
+            fl = []
             try:
                 with os.scandir(d) as it:
                     for e in it:
                         try:
-                            if e.is_dir(follow_symlinks=False) \
-                                    and e.name.lower() not in SKIP_DIRS:
-                                found.append(e.path)
-                                if not _is_junction(e):
-                                    subs.append(e.path)
+                            if e.is_dir(follow_symlinks=False):
+                                if e.name.lower() not in SKIP_DIRS:
+                                    found.append(e.path)
+                                    if not _is_junction(e):
+                                        subs.append(e.path)
+                            elif files is not None \
+                                    and not is_office_temp(e.name):
+                                fl.append(e.path)
                         except OSError:
                             pass
             except OSError:
                 pass
             with lock:
                 result.extend(found)
+                if fl:
+                    files.extend(fl)
                 state["pending"] += len(subs) - 1
                 state["done"] += 1
                 done = state["done"]
@@ -1118,12 +1133,27 @@ def scan_dirs(roots, stop, progress):
     return result
 
 
-def save_dirindex(paths):
-    tmp = DIRIDX_FILE + ".tmp"
+def save_dirindex(paths, path=None):
+    path = path or DIRIDX_FILE
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", errors="replace") as f:
         for p in paths:
             f.write(p + "\n")
-    os.replace(tmp, DIRIDX_FILE)
+    os.replace(tmp, path)
+
+
+def read_conf():
+    """設定ファイル(doc_search_conf.txt) -> dict"""
+    conf = {}
+    try:
+        with open(CONF_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return conf
 
 
 def _basename(p):
@@ -1174,10 +1204,11 @@ class _IndexSnap:
 
 
 class DirIndex:
-    """フォルダの全パス一覧。フォルダ名(末尾要素)用とパス全体用の
-    2つの検索用テキストを持ち、既定はフォルダ名そのものに一致させる"""
+    """フォルダ(またはファイル)の全パス一覧。名前(末尾要素)用とパス全体用の
+    2つの検索用テキストを持ち、既定は名前そのものに一致させる"""
 
-    def __init__(self):
+    def __init__(self, path=None):
+        self.path = path            # None なら DIRIDX_FILE
         self.snap = _IndexSnap([])
 
     @property
@@ -1187,7 +1218,7 @@ class DirIndex:
     def load(self):
         paths = []
         try:
-            with open(DIRIDX_FILE, "r", encoding="utf-8",
+            with open(self.path or DIRIDX_FILE, "r", encoding="utf-8",
                       errors="replace") as f:
                 for ln in f:
                     p = ln.rstrip("\r\n")
@@ -1208,12 +1239,14 @@ class DirIndex:
         self.snap = _IndexSnap(list(paths))
 
     def search(self, query, limit, full_path=False, sort="rank",
-               desc=False, stop=None):
+               desc=False, stop=None, with_keys=False):
         """query: 検索欄の文字列。full_path=False ならフォルダ名のみに一致
         (\\ や / を含む語だけはパス全体に照合)。
         sort: "rank"=関連度順(完全一致 > 前方一致 > 部分一致、浅い階層優先)
               "name"=名前順 / "path"=パス順
         戻り値: (総ヒット数, 並べ替え後の上位limit件のパス)。
+        with_keys=True なら上位は (並べ替えキー, パス) のリスト
+        (複数のインデックスの結果を同じ順序で混ぜるのに使う)。
         stop(Event)がセットされたら中断して None を返す"""
         s = self.snap
         toks = parse_query(query)
@@ -1288,8 +1321,8 @@ class DirIndex:
                 p = s.paths[li]
                 if not first:
                     r = 2
-                elif name == first:
-                    r = 0
+                elif name == first or name.rsplit(".", 1)[0] == first:
+                    r = 0        # 完全一致(ファイルは拡張子を除いて一致も)
                 elif name.startswith(first):
                     r = 1
                 elif first in name:
@@ -1306,6 +1339,8 @@ class DirIndex:
             top = heapq.nlargest(limit, hits, key=keyf)
         else:
             top = heapq.nsmallest(limit, hits, key=keyf)
+        if with_keys:
+            return total, [(keyf(li), s.paths[li]) for li in top]
         return total, [s.paths[li] for li in top]
 
 
@@ -1367,9 +1402,15 @@ def cli_scan():
             sys.stdout.flush()
 
     print("対象ルート: " + ", ".join(roots))
-    paths = scan_dirs(roots, stop, prog)
+    files = [] if read_conf().get("fileidx", "1") == "1" else None
+    paths = scan_dirs(roots, stop, prog, files)
     save_dirindex(paths)
-    print("\n完了: %d フォルダをインデックス化しました" % len(paths))
+    if files is not None:
+        save_dirindex(files, FILEIDX_FILE)
+        print("\n完了: %d フォルダ / %d ファイルをインデックス化しました"
+              % (len(paths), len(files)))
+    else:
+        print("\n完了: %d フォルダをインデックス化しました" % len(paths))
 
 
 # ============================================================
@@ -1702,6 +1743,8 @@ class App:
         self.favs = load_favs()
         self.index = DirIndex()
         self.idx_state = "none"
+        self.findex = DirIndex(FILEIDX_FILE)    # ファイル名のインデックス
+        self.fidx_state = "none"
         self.etabs = load_tabs()
         self.cur_et = 0
         self.panes = [Pane(0), Pane(1)]
@@ -1723,6 +1766,7 @@ class App:
         self.doc_stop = threading.Event()
         # フォルダ検索タブ(Everything風)の状態
         self.find_paths = {}
+        self.find_isfile = {}
         self.find_sort = ("rank", False)
         self._find_gen = 0
         self._find_stop = threading.Event()
@@ -2148,6 +2192,12 @@ class App:
         self.var_scandate = tk.StringVar(value="")
         ttk.Label(srow, textvariable=self.var_scandate,
                   style="Sub.TLabel").pack(side="left", padx=6)
+        self.var_fileidx = tk.BooleanVar(
+            value=conf.get("fileidx", "1") == "1")
+        ttk.Checkbutton(tab2, text="ファイル名もインデックスに含める"
+                                   "（フォルダ検索タブでファイルも探せる）",
+                        variable=self.var_fileidx,
+                        command=self.save_conf).pack(anchor="w", padx=14)
         ttk.Label(tab2, style="Sub.TLabel", padding=(8, 2),
                   text="夜間の自動更新: タスクスケジューラに "
                        "python doc_search.py --scan を登録"
@@ -2604,6 +2654,8 @@ class App:
         if tab in (TAB_EXP, TAB_FIND):
             self.ensure_index()
         if tab == TAB_FIND:
+            if self.find_mode() != "dir":
+                self.ensure_findex()
             self.update_find_info()
             self.root.after_idle(self.focus_find_default)
 
@@ -2744,7 +2796,7 @@ class App:
             if target:
                 self.var_dir.set(target)
         elif tab == TAB_FIND:
-            path = self.find_focus_path()
+            path = self.find_focus_place()
             if path:
                 self.var_dir.set(path)
         self.nb.select(self.tab1)
@@ -3167,6 +3219,20 @@ class App:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def ensure_findex(self):
+        """ファイル名インデックスを読み込む(大きいので必要になった時だけ)"""
+        if self.fidx_state in ("ready", "loading"):
+            return
+        if not os.path.exists(FILEIDX_FILE):
+            return
+        self.fidx_state = "loading"
+
+        def run():
+            self.findex.load()
+            self.fq.put(("fidxdone", len(self.findex.paths)))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def update_scan_label(self):
         try:
             t = os.path.getmtime(DIRIDX_FILE)
@@ -3491,7 +3557,11 @@ class App:
                 elif k == "scandone":
                     self.scanning = False
                     self.idx_state = "ready"
-                    self.status.set("インデックス更新完了: %dフォルダ" % msg[1])
+                    txt = "インデックス更新完了: %dフォルダ" % msg[1]
+                    if msg[2] is not None:
+                        self.fidx_state = "ready"
+                        txt += " / %dファイル" % msg[2]
+                    self.status.set(txt)
                     self.update_scan_label()
                     self.build_side()
                     self.after_index_change()
@@ -3505,6 +3575,11 @@ class App:
                     self._pending_fsearch = False
                     if pend and self.cur_tab() == TAB_EXP:
                         self.show_dsearch(*pend)
+                    self.after_index_change()
+                elif k == "fidxdone":
+                    self.fidx_state = "ready"
+                    self.status.set("ファイル名インデックス読込完了: %dファイル"
+                                    % msg[1])
                     self.after_index_change()
         except queue.Empty:
             pass
@@ -3529,15 +3604,23 @@ class App:
         self.scan_stop = threading.Event()
         self.status.set("スキャン開始...")
 
+        want_files = bool(self.var_fileidx.get())
+
         def run():
+            files = [] if want_files else None
             paths = scan_dirs(roots, self.scan_stop,
-                              lambda d, t: self.fq.put(("scanprog", t)))
+                              lambda d, t: self.fq.put(("scanprog", t)),
+                              files)
             if self.scan_stop.is_set():
                 self.fq.put(("scanstop",))
                 return
             save_dirindex(paths)
             self.index.set_paths(paths)
-            self.fq.put(("scandone", len(paths)))
+            if files is not None:
+                save_dirindex(files, FILEIDX_FILE)
+                self.findex.set_paths(files)
+            self.fq.put(("scandone", len(paths),
+                         len(files) if files is not None else None))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -3552,20 +3635,35 @@ class App:
         self.scan_stop = threading.Event()
         self.status.set("部分再スキャン中: " + path)
 
+        # ファイル名インデックスがあれば、その部分も作り直す
+        want_files = os.path.exists(FILEIDX_FILE)
+
         def run():
+            files = [] if want_files else None
             add = scan_dirs([path], self.scan_stop,
-                            lambda d, t: self.fq.put(("scanprog", t)))
+                            lambda d, t: self.fq.put(("scanprog", t)),
+                            files)
             if self.scan_stop.is_set():
                 self.fq.put(("scanstop",))
                 return
             low = path.lower().rstrip("\\/")
-            kept = [p for p in self.index.paths
-                    if p.lower() != low
-                    and not p.lower().startswith(low + os.sep)]
-            allp = kept + add
+
+            def outside(p):
+                pl = p.lower()
+                return pl != low and not pl.startswith(low + os.sep)
+
+            allp = [p for p in self.index.paths if outside(p)] + add
             save_dirindex(allp)
             self.index.set_paths(allp)
-            self.fq.put(("scandone", len(allp)))
+            nfiles = None
+            if files is not None:
+                if self.fidx_state != "ready":
+                    self.findex.load()
+                allf = [p for p in self.findex.paths if outside(p)] + files
+                save_dirindex(allf, FILEIDX_FILE)
+                self.findex.set_paths(allf)
+                nfiles = len(allf)
+            self.fq.put(("scandone", len(allp), nfiles))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -3937,11 +4035,11 @@ class App:
         tab = self.tabd
         top = ttk.Frame(tab, padding=(10, 8, 10, 4))
         top.pack(fill="x")
-        ttk.Label(top, text="フォルダ名:").pack(side="left")
+        ttk.Label(top, text="名前:").pack(side="left")
         self.var_find = tk.StringVar()
         self.ent_find = ttk.Entry(top, textvariable=self.var_find)
         self.ent_find.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        Tip(self.ent_find, "入力するそばから全フォルダを検索 (Ctrl+F)\n"
+        Tip(self.ent_find, "入力するそばからフォルダ/ファイル名を検索 (Ctrl+F)\n"
                            "スペース=AND  -語=除外  *?=ワイルドカード\n"
                            "\\ や / を含む語はパス全体で照合  "
                            "↓で結果へ  Escで消去")
@@ -3949,13 +4047,25 @@ class App:
         self.ent_find.bind("<Return>", self.on_find_enter)
         self.ent_find.bind("<Down>", self.on_find_down)
         self.ent_find.bind("<Escape>", self.on_find_escape)
+        ttk.Label(top, text="  対象:").pack(side="left")
+        mode = conf.get("fmode", "dir")
+        self.var_fmode = tk.StringVar(
+            value=FIND_MODES.get(mode, FIND_MODES["dir"]))
+        cb = ttk.Combobox(top, textvariable=self.var_fmode, width=8,
+                          state="readonly", values=list(FIND_MODES.values()))
+        cb.pack(side="left", padx=(4, 0))
+        cb.bind("<<ComboboxSelected>>", lambda e: self.on_fmode_change())
+        self.cb_fmode = cb
+        Tip(cb, "フォルダ / ファイル / 両方 (Ctrl+Shift+F で切替)\n"
+                "ファイルを探すには設定タブの「ファイル名もインデックスに"
+                "含める」をONにしてインデックス更新")
         self.var_fpath = tk.BooleanVar(value=conf.get("fpath", "0") == "1")
         chk = ttk.Checkbutton(top, text="パス全体も対象",
                               variable=self.var_fpath,
                               command=self.on_fpath_toggle)
         chk.pack(side="left", padx=(10, 0))
         Tip(chk, "ON: パスのどこかに含まれれば一致\n"
-                 "OFF: フォルダ名そのものに含まれる場合だけ一致")
+                 "OFF: 名前そのものに含まれる場合だけ一致")
         b = ttk.Button(top, text="インデックス更新", takefocus=False,
                        command=self.full_scan)
         b.pack(side="left", padx=(10, 0))
@@ -3996,18 +4106,23 @@ class App:
         t.bind("<Escape>", lambda e: (self.focus_find_entry(), "break")[1])
         t.bind("<Control-c>", lambda e: (self.find_copy(), "break")[1])
         t.bind("<BackSpace>", self.on_find_backspace)
+        for w in (t, self.ent_find):
+            w.bind("<Control-Shift-F>",
+                   lambda e: (self.cycle_fmode(), "break")[1])
         t.bind("<KeyPress>", self.on_find_tree_key)
 
         m = tk.Menu(self.root, tearoff=0)
         self.dmenu = m
-        m.add_command(label="エクスプローラタブで開く (Enter)",
+        m.add_command(label="開く (Enter)",
                       command=lambda: self.fd_do("app"))
         m.add_command(label="新しいタブで開く (Shift+Enter)",
                       command=lambda: self.fd_do("newtab"))
-        m.add_command(label="親フォルダを開いてこのフォルダを選択",
+        m.add_command(label="場所(親フォルダ)を開いて選択",
                       command=lambda: self.fd_do("parent"))
         m.add_command(label="Explorerで開く (Ctrl+Enter)",
                       command=lambda: self.fd_do("explorer"))
+        m.add_command(label="サクラエディタで開く (Ctrl+Shift+E)",
+                      command=lambda: self.fd_do("editor"))
         m.add_separator()
         m.add_command(label="この場所で文書内検索 (Ctrl+G)",
                       command=lambda: self.fd_do("todoc"))
@@ -4035,9 +4150,31 @@ class App:
                       command=lambda: self.fd_do("rescan"))
         return gold
 
+    def find_mode(self):
+        """フォルダ検索タブの対象: "dir" / "file" / "both" """
+        v = self.var_fmode.get()
+        for k, label in FIND_MODES.items():
+            if label == v:
+                return k
+        return "dir"
+
+    def on_fmode_change(self):
+        self.save_conf()
+        if self.find_mode() != "dir":
+            self.ensure_findex()
+        self.update_find_info()
+        self.run_find()
+
+    def cycle_fmode(self):
+        keys = list(FIND_MODES)
+        k = keys[(keys.index(self.find_mode()) + 1) % len(keys)]
+        self.var_fmode.set(FIND_MODES[k])
+        self.on_fmode_change()
+        self.status.set("フォルダ検索の対象: " + FIND_MODES[k])
+
     def find_state(self):
         return (self.var_find.get(), bool(self.var_fpath.get()),
-                self.find_sort)
+                self.find_sort, self.find_mode())
 
     def update_find_info(self, text=None):
         """フォルダ検索タブの案内行(件数やインデックスの状態)を更新"""
@@ -4049,15 +4186,27 @@ class App:
         self.var_find_info.set(text)
 
     def find_idle_text(self):
-        if self.idx_state == "ready":
+        mode = self.find_mode()
+        if mode != "dir" and not os.path.exists(FILEIDX_FILE):
+            return ("ファイル名インデックスがありません: 設定タブの「ファイル名も"
+                    "インデックスに含める」をONにして「インデックス更新」"
+                    "(Ctrl+Shift+I) を押してください")
+        if self.idx_state == "ready" and (
+                mode == "dir" or self.fidx_state == "ready"):
             try:
                 when = fmt_time(os.path.getmtime(DIRIDX_FILE))
             except OSError:
                 when = "未保存"
-            return ("全 %s フォルダから検索します（最終スキャン: %s）。"
+            what = []
+            if mode != "file":
+                what.append("%s フォルダ" % format(len(self.index.paths), ","))
+            if mode != "dir":
+                nf = len(self.findex.paths)
+                what.append("%s ファイル" % format(nf, ","))
+            return ("全 %s から検索します（最終スキャン: %s）。"
                     "スペース=AND  -語=除外  *?=ワイルドカード"
-                    % (format(len(self.index.paths), ","), when))
-        if self.idx_state == "loading":
+                    % (" / ".join(what), when))
+        if "loading" in (self.idx_state, self.fidx_state):
             return "インデックス読込中..."
         if not os.path.exists(DIRIDX_FILE):
             return ("インデックス未作成: 設定タブの「検索ルート」に対象"
@@ -4079,27 +4228,45 @@ class App:
         self._find_gen += 1
         gen = self._find_gen
         state = self.find_state()
-        query, full, (sort, desc) = state
+        query, full, (sort, desc), mode = state
         if not parse_query(query):
             self._find_focus_after = False
             self.fill_find(0, [], None)
             return
-        if self.idx_state != "ready":
-            self.ensure_index()
+        # 対象に応じたインデックス: (インデックス, ファイルか)
+        targets = []
+        if mode != "file":
+            if self.idx_state != "ready":
+                self.ensure_index()
+            targets.append((self.index, False))
+        if mode != "dir":
+            if self.fidx_state != "ready":
+                self.ensure_findex()
+            targets.append((self.findex, True))
+        if (mode != "file" and self.idx_state != "ready") or \
+                (mode != "dir" and self.fidx_state != "ready"):
             self.update_find_info(self.find_idle_text())
             return
         stop = threading.Event()
         self._find_stop = stop
         self._find_running = state
-        index = self.index
         t0 = time.time()
 
         def work():
-            res = index.search(query, MAX_ROWS, full_path=full, sort=sort,
-                               desc=desc, stop=stop)
-            if res is not None:
-                self.fq.put(("finddone", gen, res[0], res[1],
-                             time.time() - t0))
+            total = 0
+            lists = []
+            for index, isfile in targets:
+                res = index.search(query, MAX_ROWS, full_path=full,
+                                   sort=sort, desc=desc, stop=stop,
+                                   with_keys=True)
+                if res is None:
+                    return
+                total += res[0]
+                lists.append([(k, p, isfile) for k, p in res[1]])
+            # 各インデックスの上位を同じ並べ替えキーで混ぜる
+            merged = heapq.merge(*lists, key=lambda x: x[0], reverse=desc)
+            hits = [(p, isfile) for _k, p, isfile in merged][:MAX_ROWS]
+            self.fq.put(("finddone", gen, total, hits, time.time() - t0))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -4110,13 +4277,19 @@ class App:
         if kids:
             t.delete(*kids)
         self.find_paths = {}
-        ico = self.icons["folder"]
+        self.find_isfile = {}
         sel = None
-        for i, p in enumerate(hits):
-            iid = t.insert("", "end", text=_basename(p), image=ico,
-                           values=(parent_of(p),),
-                           tags=("folder", "odd" if i % 2 else "even"))
+        for i, (p, isfile) in enumerate(hits):
+            name = _basename(p)
+            stripe = "odd" if i % 2 else "even"
+            if isfile:
+                ico, tags = self.icons[file_type(name)[0]], (stripe,)
+            else:
+                ico, tags = self.icons["folder"], ("folder", stripe)
+            iid = t.insert("", "end", text=name, image=ico,
+                           values=(parent_of(p),), tags=tags)
             self.find_paths[iid] = p
+            self.find_isfile[iid] = isfile
             if p == keep:
                 sel = iid
         kids = t.get_children()
@@ -4242,6 +4415,14 @@ class App:
     def find_focus_path(self):
         return self.find_paths.get(self.dtree.focus())
 
+    def find_focus_place(self):
+        """フォーカス行のフォルダ(ファイル行ならその親フォルダ)"""
+        iid = self.dtree.focus()
+        path = self.find_paths.get(iid)
+        if path and self.find_isfile.get(iid):
+            return parent_of(path)
+        return path
+
     def find_copy(self):
         paths = [self.find_paths[i] for i in self.dtree.selection()
                  if i in self.find_paths]
@@ -4296,36 +4477,55 @@ class App:
         return "break"
 
     def fd_do(self, act):
-        """フォルダ検索の結果行に対する操作"""
+        """フォルダ検索の結果行(フォルダまたはファイル)に対する操作"""
         path = self.find_paths.get(self.dmenu_iid)
         if not path:
             return
+        isfile = self.find_isfile.get(self.dmenu_iid, False)
+        # ファイルなら「その場所」= 親フォルダを対象にする操作
+        place = parent_of(path) if isfile else path
         if act in ("app", "newtab", "parent", "explorer", "todoc", "fav",
-                   "props") or act.startswith("term_"):
-            if not os.path.isdir(path):
-                self.status.set("フォルダが存在しません: " + path +
+                   "props", "editor") or act.startswith("term_"):
+            ok = os.path.isfile(path) if isfile else os.path.isdir(path)
+            if not ok:
+                self.status.set(("ファイル" if isfile else "フォルダ")
+                                + "が存在しません: " + path +
                                 "（インデックスが古い可能性。右クリック→"
-                                "親フォルダで再スキャン、またはインデックス更新）")
+                                "再スキャン、またはインデックス更新）")
                 return
         if act == "app":
-            self.open_dir_in_app(path)
+            if isfile:
+                self.open_file_path(path)
+            else:
+                self.open_dir_in_app(path)
         elif act == "newtab":
-            self.open_dir_in_app(path, newtab=True)
+            self.open_dir_in_app(place, newtab=True,
+                                 select=path if isfile else None)
         elif act == "parent":
             parent = parent_of(path)
             if parent:
                 self.open_dir_in_app(parent, select=path)
         elif act == "explorer":
-            self.open_folder_plain(path)
+            if isfile:
+                self.open_folder_sel(path)
+            else:
+                self.open_folder_plain(path)
+        elif act == "editor":
+            if isfile:
+                sel = [self.find_paths[i] for i in self.dtree.selection()
+                       if self.find_isfile.get(i)]
+                self.open_in_editor(sel if path in sel else [path])
+            else:
+                self.status.set("ファイル行で実行してください")
         elif act == "todoc":
-            self.var_dir.set(path)
+            self.var_dir.set(place)
             self.nb.select(self.tab1)
             self.focus_widget(self.ent_word)
             self.status.set("文書内検索のフォルダに設定しました")
         elif act == "fav":
             self._add_fav(path)
         elif act.startswith("term_"):
-            self.open_terminal_here(act[5:], path)
+            self.open_terminal_here(act[5:], place)
         elif act == "props":
             self.show_properties(path)
         elif act == "cp_full":
@@ -4336,7 +4536,7 @@ class App:
         elif act == "cp_name":
             self.to_clip(_basename(path))
         elif act == "rescan":
-            self.rescan_subtree(path)
+            self.rescan_subtree(place)
 
     def open_dir_in_app(self, path, newtab=False, select=None):
         """フォルダをこのアプリのエクスプローラタブで開く"""
@@ -4344,6 +4544,8 @@ class App:
         self.focus_list = True
         if newtab:
             self.new_tab(path)
+            if select:
+                self.sel_target = select
         else:
             if select:
                 self.sel_target = select
@@ -4392,6 +4594,9 @@ class App:
                 paths = [self.fpaths.get(self.ftree.focus(), "")]
         elif tab == TAB_DOC:
             paths = [self.paths.get(self.tree.focus(), "")]
+        elif tab == TAB_FIND:
+            self.find_open("editor")
+            return
         else:
             return
         self.open_in_editor(paths)
@@ -4439,7 +4644,7 @@ class App:
         elif tab == TAB_DOC:
             self.open_terminal_here(kind, self.doc_dir_of(self.tree.focus()))
         elif tab == TAB_FIND:
-            self.open_terminal_here(kind, self.find_focus_path())
+            self.open_terminal_here(kind, self.find_focus_place())
 
     def show_properties(self, path=None):
         if path is None:
@@ -4627,6 +4832,9 @@ class App:
                 f.write("dpath=" + ("1" if self.var_dpath.get() else "0")
                         + "\n")
                 f.write("fpath=" + ("1" if self.var_fpath.get() else "0")
+                        + "\n")
+                f.write("fmode=" + self.find_mode() + "\n")
+                f.write("fileidx=" + ("1" if self.var_fileidx.get() else "0")
                         + "\n")
                 f.write("showtmp=" + ("1" if self.var_showtmp.get() else "0")
                         + "\n")
